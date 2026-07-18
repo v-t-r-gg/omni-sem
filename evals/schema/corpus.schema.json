@@ -1,0 +1,2 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Omni-Sem corpus record","type":"object","additionalProperties":false,"required":["document_id","path","revision","segments"],"properties":{"document_id":{"type":"string"},"path":{"type":"string"},"revision":{"type":"string"},"segments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["anchor","text"],"properties":{"anchor":{"type":"string"},"text":{"type":"string"}}}}}}
+

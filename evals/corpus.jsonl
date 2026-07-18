@@ -1,0 +1,4 @@
+{"document_id":"architecture-current","path":"fixtures/architecture.md","revision":"current","segments":[{"anchor":"heading:storage","text":"SQLite is the initial system of record."},{"anchor":"heading:graph","text":"The graph is derived, not canonical."}]}
+{"document_id":"architecture-old","path":"fixtures/archive/architecture.md","revision":"stale","segments":[{"anchor":"heading:storage","text":"A remote graph database was considered."}]}
+{"document_id":"meeting-notes","path":"fixtures/meeting.md","revision":"current","segments":[{"anchor":"heading:decision","text":"The team confirmed SQLite and rejected a required database service."}]}
+

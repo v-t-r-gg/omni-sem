@@ -1,0 +1,3 @@
+{"query_id":"storage-choice","required":["architecture-current#heading:storage"],"acceptable":["meeting-notes#heading:decision"],"misleading":["architecture-old#heading:storage"],"expected_source_diversity":2}
+{"query_id":"graph-authority","required":["architecture-current#heading:graph"],"acceptable":[],"misleading":[],"expected_source_diversity":1}
+

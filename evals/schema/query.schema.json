@@ -1,0 +1,2 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Omni-Sem evaluation query","type":"object","additionalProperties":false,"required":["query_id","query"],"properties":{"query_id":{"type":"string"},"query":{"type":"string"},"relationship_should_help":{"type":"boolean"},"newest_revision_matters":{"type":"boolean"}}}
+

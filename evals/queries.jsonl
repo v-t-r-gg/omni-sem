@@ -1,0 +1,3 @@
+{"query_id":"storage-choice","query":"What storage design was selected?","relationship_should_help":false,"newest_revision_matters":true}
+{"query_id":"graph-authority","query":"Is the graph canonical?","relationship_should_help":false,"newest_revision_matters":false}
+

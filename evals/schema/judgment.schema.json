@@ -1,0 +1,2 @@
+{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Omni-Sem relevance judgment","type":"object","additionalProperties":false,"required":["query_id","required","acceptable","misleading","expected_source_diversity"],"properties":{"query_id":{"type":"string"},"required":{"type":"array","items":{"type":"string"}},"acceptable":{"type":"array","items":{"type":"string"}},"misleading":{"type":"array","items":{"type":"string"}},"expected_source_diversity":{"type":"integer","minimum":1}}}
+

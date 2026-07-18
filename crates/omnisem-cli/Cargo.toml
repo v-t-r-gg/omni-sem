@@ -1,0 +1,20 @@
+[package]
+name = "omnisem-cli"
+description = "Command-line interface for Omni-Sem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "omnisem"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+omnisem-core = { path = "../omnisem-core" }
+
+[lints]
+workspace = true
+
