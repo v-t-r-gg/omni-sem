@@ -52,6 +52,8 @@ pub enum ConfigError {
     MissingPath(PathBuf),
     #[error("I/O error for {path}: {message}")]
     Io { path: PathBuf, message: String },
+    #[error("BUDGET_PRESET_NOT_FOUND: {0}")]
+    BudgetPresetNotFound(String),
 }
 
 /// Stable file-read failures.
@@ -100,6 +102,35 @@ impl IndexError {
     }
 }
 
+/// Retrieval and evaluation failures.
+#[derive(Debug, thiserror::Error)]
+pub enum RetrievalError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Domain(#[from] DomainError),
+    #[error("evaluation bundle error: {0}")]
+    Evaluation(String),
+    #[error("internal retrieval error: {0}")]
+    Internal(String),
+}
+
+impl RetrievalError {
+    /// Maps a retrieval error to a process exit category.
+    #[must_use]
+    pub fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Config(error) => error.exit_code(),
+            Self::Storage(_) => ExitCode::Database,
+            Self::Domain(DomainError::BudgetPresetNotFound(_)) => ExitCode::Configuration,
+            Self::Domain(_) | Self::Evaluation(_) => ExitCode::InvalidInput,
+            Self::Internal(_) => ExitCode::Internal,
+        }
+    }
+}
+
 impl ConfigError {
     /// Maps a configuration error to a process exit category.
     #[must_use]
@@ -112,7 +143,8 @@ impl ConfigError {
             | Self::DuplicateRootName(_)
             | Self::RootNotFound(_)
             | Self::NotDirectory(_)
-            | Self::MissingPath(_) => ExitCode::Configuration,
+            | Self::MissingPath(_)
+            | Self::BudgetPresetNotFound(_) => ExitCode::Configuration,
             Self::PathsUnavailable | Self::HomeUnavailable | Self::Io { .. } => {
                 ExitCode::Filesystem
             }

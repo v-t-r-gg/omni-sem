@@ -2,48 +2,34 @@
 
 ## Crates
 
-- `omnisem-core`: domain types, configuration, discovery, parsers, stable reads, hashing, SQLite persistence, indexing service.
-- `omnisem-cli`: clap command surface, JSON/human output, exit-code mapping, process wiring.
+- `omnisem-core`: domain, config, discovery, parsers, indexing, retrieval, evaluation.
+- `omnisem-cli`: command surface, output formatting, exit-code mapping.
 
-Domain types remain independent of SQLite row shapes. Protocol adapters are still deferred.
-
-## Operational pipeline (Milestone 1)
+## Operational pipeline
 
 ```text
-Explicit local configuration
-    → approved root lifecycle
-    → safe ignore-aware discovery
-    → stable bounded reads + BLAKE3 hashing
-    → deterministic Markdown | plain-text parsing
-    → immutable revision + segment persistence
-    → transactional active-only FTS5 promotion
-    → status and revision-history reporting
+configuration + approved roots
+    → discovery/parse/index (immutable revisions, active FTS)
+    → lexical query (safe MATCH)
+    → BM25 ranking + filters
+    → sensitivity filter + dedupe
+    → freshness metadata inspection
+    → token-budget packing
+    → human/JSON output
 ```
 
-## Configuration
+## Lexical ranking
 
-Platform directories come from the `directories` crate (`dev.OmniSem.omnisem`). Defaults:
+FTS5 `bm25(segments_fts)` is lower-is-better and typically negative. Public `score` is `-raw_bm25` so higher is better. This is **not** normalized to `[0, 1]` and is not comparable with future semantic or hybrid scores. Raw BM25 remains in `RetrievalSignals.raw_bm25`. Tie-breakers: relative path, anchor, segment id ascending. Candidates capped at `min(limit*8, 200)`.
 
-- config: platform config dir + `config.toml`
-- database: platform data dir + `index.sqlite3`
-- logs: platform data dir + `logs/`
+## Token estimation
 
-TOML uses `serde` with `deny_unknown_fields`. Home expansion (`~/`) happens only at the path boundary. Roots are never added automatically.
+Heuristic: `ceil(char_count / 3)` plus fixed response/result overhead. Conservative, not model-exact.
 
-## Revision and FTS invariants
+## Evaluation
 
-- Revisions are immutable.
-- Unchanged content with the same parser ID/version skips reparse.
-- Parser-version changes create a new revision projection for the same bytes.
-- Parse or promotion failure leaves the prior current revision and its FTS rows active.
-- Promotion deletes previous active FTS rows, inserts new ones, and updates the current pointer in one transaction.
-- Successful full-root discovery may mark missing active files deleted and clear their FTS rows.
-- Incomplete discovery failure does not run deletion inference.
+`omnisem eval` materializes `evals/corpus.jsonl` into a temporary root, indexes with production code, runs judged queries, and emits aggregate metrics without touching the user index.
 
-## FTS design
+## Security
 
-`segments_fts` stores duplicated segment text plus unindexed identity metadata. Only active revisions are present. See ADR-0013.
-
-## Security boundary
-
-Explicit roots, canonical containment, default no symlink following, special-file skips, size limits on discovery and read, restrictive config/database permissions where supported, no source text in logs or CLI summaries, sensitivity tags persisted for later retrieval filtering.
+Active revisions only, approved roots only, relative paths in results, safe FTS construction, no source logging, sensitivity filtering before packing, isolated evaluation databases.

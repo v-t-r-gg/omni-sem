@@ -16,6 +16,7 @@ pulldown-cmark.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 uuid.workspace = true

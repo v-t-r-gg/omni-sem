@@ -54,3 +54,25 @@ Reports configuration path, database path, schema version, counters, last scan t
 ### `omnisem changes [--since 7d|12h|30m|90s] [--root ROOT_ID] [--json]`
 
 Reports additions, modifications, and deletions from stored source/revision records without printing source text.
+
+### `omnisem query QUERY [options]`
+
+Lexical retrieval over active FTS rows.
+
+Options:
+
+- `--mode lexical|auto|semantic|hybrid` (`semantic`/`hybrid` unavailable)
+- `--root ROOT_ID`
+- `--file-type markdown|plain_text`
+- `--limit N`
+- `--token-budget N`
+- `--budget NAME` (mutually exclusive with `--limit` / `--token-budget`)
+- `--include-sensitive`
+- `--explain`
+- `--json`
+
+Public lexical scores are higher-is-better (`public = -raw_bm25`). Raw FTS5 BM25 remains in JSON signals (lower-is-better, often negative). Scores are not probabilities and are not comparable across retrieval modes.
+
+### `omnisem eval [--corpus PATH] [--mode lexical] [--json]`
+
+Runs the production indexer and retriever against an evaluation bundle in an isolated temporary data root. Default bundle is the repository `evals/` directory when present.

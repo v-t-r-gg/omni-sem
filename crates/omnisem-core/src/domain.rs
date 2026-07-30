@@ -517,14 +517,110 @@ pub enum RetrievalMode {
     Auto,
 }
 
+impl RetrievalMode {
+    /// Returns the stable storage/output token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
+            Self::Hybrid => "hybrid",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl FromStr for RetrievalMode {
+    type Err = DomainError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "lexical" => Ok(Self::Lexical),
+            "semantic" => Ok(Self::Semantic),
+            "hybrid" => Ok(Self::Hybrid),
+            "auto" => Ok(Self::Auto),
+            _ => Err(DomainError::InvalidRetrievalMode),
+        }
+    }
+}
+
+/// Named context-budget profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetPreset {
+    pub name: String,
+    pub token_budget: u32,
+    pub max_results: u16,
+}
+
 /// Normalized retrieval request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetrievalQuery {
     pub query: String,
     pub root_ids: Vec<RootId>,
+    pub file_types: Vec<SupportedFileType>,
     pub mode: RetrievalMode,
     pub limit: RetrievalLimit,
     pub token_budget: TokenBudget,
+    pub include_sensitive: bool,
+    pub budget_preset: Option<String>,
+}
+
+/// Ranking and channel signals retained for debugging and evaluation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalSignals {
+    pub channel: String,
+    pub raw_bm25: Option<f32>,
+    pub public_score: f32,
+}
+
+/// Deterministic match explanation without model inference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchExplanation {
+    pub matched_terms: Vec<String>,
+    pub matched_excerpt: Option<String>,
+    pub explanation_kind: ExplanationKind,
+}
+
+/// How a result was justified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplanationKind {
+    LexicalTermOverlap,
+    SemanticNeighbor,
+    StructuralExpansion,
+}
+
+impl ExplanationKind {
+    /// Returns the stable output token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LexicalTermOverlap => "lexical_term_overlap",
+            Self::SemanticNeighbor => "semantic_neighbor",
+            Self::StructuralExpansion => "structural_expansion",
+        }
+    }
+}
+
+/// Relationship between indexed state and the live filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessStatus {
+    Current,
+    PendingReindex,
+    Unknown,
+}
+
+impl FreshnessStatus {
+    /// Returns the stable output token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::PendingReindex => "pending_reindex",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Source-grounded retrieval result.
@@ -532,10 +628,20 @@ pub struct RetrievalQuery {
 pub struct RetrievalHit {
     pub segment_id: SegmentId,
     pub revision_id: RevisionId,
+    pub source_file_id: SourceFileId,
+    pub root_id: RootId,
     pub relative_path: PathBuf,
+    pub file_type: SupportedFileType,
     pub anchor: String,
     pub text: String,
+    pub text_hash: ContentHash,
     pub score: f32,
+    pub signals: RetrievalSignals,
+    pub explanation: MatchExplanation,
+    pub freshness: FreshnessStatus,
+    pub sensitivity_scope: Option<SensitivityScope>,
+    pub token_estimate: u32,
+    pub truncated: bool,
 }
 
 /// Normalized response shared by CLI and future protocol adapters.
@@ -546,7 +652,12 @@ pub struct RetrievalResponse {
     pub results: Vec<RetrievalHit>,
     pub token_estimate: u32,
     pub truncated: bool,
+    pub applied_limit: u16,
+    pub applied_token_budget: u32,
+    pub budget_preset: Option<String>,
+    pub duplicates_suppressed: u32,
     pub warnings: Vec<String>,
+    pub elapsed_ms: u64,
 }
 
 /// Domain validation failures.
@@ -574,6 +685,16 @@ pub enum DomainError {
     InvalidScanStatus,
     #[error("invalid duration syntax")]
     InvalidDuration,
+    #[error("invalid retrieval mode")]
+    InvalidRetrievalMode,
+    #[error("QUERY_EMPTY")]
+    QueryEmpty,
+    #[error("QUERY_INVALID: {0}")]
+    QueryInvalid(String),
+    #[error("RETRIEVAL_MODE_UNAVAILABLE: {0}")]
+    RetrievalModeUnavailable(String),
+    #[error("BUDGET_PRESET_NOT_FOUND: {0}")]
+    BudgetPresetNotFound(String),
 }
 
 /// Parses compact duration tokens such as `7d`, `12h`, `30m`, or `90s`.

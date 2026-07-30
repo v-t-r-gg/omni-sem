@@ -2,7 +2,7 @@
 
 Omni-Sem is a local-first, read-only semantic indexing service for AI agents.
 
-## Operational now (Milestone 1)
+## Operational now (Milestone 2)
 
 ```text
 omnisem init
@@ -10,18 +10,27 @@ omnisem root add|list|suggest|remove
 omnisem index
 omnisem status
 omnisem changes
+omnisem query
+omnisem eval
 ```
 
-These commands provide explicit configuration, approved-root lifecycle, deterministic Markdown/plain-text indexing into immutable revisions, active-only FTS5 maintenance, and operational status/history reporting.
+Deterministic local **lexical** search is operational:
+
+```text
+query → safe FTS5 MATCH → active-segment BM25 ranking
+    → sensitivity filtering → duplicate suppression
+    → freshness inspection → token-budget packing → CLI output
+```
+
+Evaluation runs against isolated temporary indexes and never mutates the user’s ordinary index.
 
 ## Not yet implemented
 
-- `omnisem query` / lexical ranking / context packing
-- `omnisem eval`
+- embeddings / semantic / hybrid retrieval
 - MCP
-- embeddings
 - `omnisem index --since`
-- snapshots, daemon, watcher, IPC, graph features
+- snapshots, daemon, watcher, IPC
+- graph features
 
 ## Quick start
 
@@ -29,7 +38,8 @@ These commands provide explicit configuration, approved-root lifecycle, determin
 cargo run -p omnisem-cli -- init
 cargo run -p omnisem-cli -- root add ./docs --name docs
 cargo run -p omnisem-cli -- index
-cargo run -p omnisem-cli -- status
+cargo run -p omnisem-cli -- query "storage architecture" --explain
+cargo run -p omnisem-cli -- eval --json
 ```
 
 Use `--data-root PATH` to isolate configuration and database files.
