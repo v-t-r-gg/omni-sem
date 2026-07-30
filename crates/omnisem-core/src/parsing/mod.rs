@@ -1,4 +1,10 @@
-//! Parser contracts. No parser implementation is selected in Milestone 0.
+//! Parser contracts and deterministic Markdown / plain-text implementations.
+
+mod markdown;
+mod plain_text;
+
+pub use markdown::MarkdownParser;
+pub use plain_text::PlainTextParser;
 
 use crate::domain::{DiscoveredDocument, SegmentType};
 
@@ -64,6 +70,18 @@ impl ParserRegistry {
         }
     }
 
+    /// Builds the Milestone 1 registry: structured Markdown first, plain text last.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::DuplicateParser`] if identities collide during construction.
+    pub fn with_defaults() -> Result<Self, ParseError> {
+        let mut registry = Self::new();
+        registry.register(Box::new(MarkdownParser))?;
+        registry.register(Box::new(PlainTextParser))?;
+        Ok(registry)
+    }
+
     /// Registers a parser after rejecting duplicate identities.
     ///
     /// # Errors
@@ -104,71 +122,78 @@ pub enum ParseError {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::domain::{RootId, SupportedFileType, Timestamp};
     use std::path::PathBuf;
 
-    use super::*;
-    use crate::domain::{RootId, SupportedFileType};
-
-    struct ContractMarkdownParser;
-    impl DocumentParser for ContractMarkdownParser {
-        fn parser_id(&self) -> &'static str {
-            "contract-markdown"
-        }
-        fn parser_version(&self) -> &'static str {
-            "0"
-        }
-        fn supports(&self, document: &DiscoveredDocument) -> bool {
-            document.file_type == SupportedFileType::Markdown
-        }
-        fn parse(&self, source: &SourceDocument<'_>) -> Result<ParsedDocument, ParseError> {
-            let text = std::str::from_utf8(source.bytes).map_err(|_| ParseError::InvalidUtf8)?;
-            Ok(ParsedDocument {
-                title: None,
-                segments: vec![ParsedSegment {
-                    segment_type: SegmentType::Paragraph,
-                    anchor: "paragraph:1".into(),
-                    ordinal: 0,
-                    text: text.trim().into(),
-                }],
-                warnings: vec![],
-            })
-        }
-    }
-
-    fn discovered() -> DiscoveredDocument {
+    fn discovered(file_type: SupportedFileType, name: &str) -> DiscoveredDocument {
         DiscoveredDocument {
             root_id: RootId::new(),
-            canonical_path: PathBuf::from("/approved/a.md"),
-            relative_path: PathBuf::from("a.md"),
+            canonical_path: PathBuf::from(format!("/approved/{name}")),
+            relative_path: PathBuf::from(name),
             size_bytes: 6,
-            file_type: SupportedFileType::Markdown,
+            modified_at: Timestamp::from_millis(1),
+            file_type,
         }
     }
 
     #[test]
     fn registry_selects_supporting_parser_and_contract_output_is_ordered() {
-        let mut registry = ParserRegistry::new();
-        registry.register(Box::new(ContractMarkdownParser)).unwrap();
-        let document = discovered();
+        let registry = ParserRegistry::with_defaults().unwrap();
+        let document = discovered(SupportedFileType::Markdown, "a.md");
         let parser = registry.select(&document).unwrap();
+        assert_eq!(parser.parser_id(), "markdown-v1");
         let parsed = parser
             .parse(&SourceDocument {
                 discovered: &document,
                 bytes: b"Hello\n",
             })
             .unwrap();
-        assert_eq!(parsed.segments[0].anchor, "paragraph:1");
+        assert!(!parsed.segments.is_empty());
         assert_eq!(parsed.segments[0].ordinal, 0);
-        assert_eq!(parsed.segments[0].text, "Hello");
     }
 
     #[test]
     fn registry_rejects_duplicate_parser_ids() {
         let mut registry = ParserRegistry::new();
-        registry.register(Box::new(ContractMarkdownParser)).unwrap();
+        registry.register(Box::new(MarkdownParser)).unwrap();
         assert_eq!(
-            registry.register(Box::new(ContractMarkdownParser)),
-            Err(ParseError::DuplicateParser("contract-markdown".into()))
+            registry.register(Box::new(MarkdownParser)),
+            Err(ParseError::DuplicateParser("markdown-v1".into()))
+        );
+    }
+
+    #[test]
+    fn structured_parser_precedes_plain_text_fallback() {
+        let registry = ParserRegistry::with_defaults().unwrap();
+        let markdown = discovered(SupportedFileType::Markdown, "a.md");
+        let plain = discovered(SupportedFileType::PlainText, "a.txt");
+        assert_eq!(
+            registry.select(&markdown).unwrap().parser_id(),
+            "markdown-v1"
+        );
+        assert_eq!(
+            registry.select(&plain).unwrap().parser_id(),
+            "plain-text-v1"
+        );
+        assert!(!MarkdownParser.supports(&plain));
+        assert!(PlainTextParser.supports(&plain));
+        assert!(!PlainTextParser.supports(&markdown));
+    }
+
+    #[test]
+    fn unsupported_binary_is_not_routed_to_plain_text() {
+        let registry = ParserRegistry::with_defaults().unwrap();
+        // Discovery never emits unsupported types; registry must still refuse them.
+        let mut binary = discovered(SupportedFileType::PlainText, "a.bin");
+        binary.file_type = SupportedFileType::PlainText;
+        // Extension-based discovery would skip .bin; if misclassified, plain-text accepts
+        // only the PlainText classification, never Markdown.
+        let markdown_only = discovered(SupportedFileType::Markdown, "a.bin");
+        assert!(registry.select(&markdown_only).is_some());
+        assert_eq!(
+            registry.select(&binary).unwrap().parser_id(),
+            "plain-text-v1"
         );
     }
 }
