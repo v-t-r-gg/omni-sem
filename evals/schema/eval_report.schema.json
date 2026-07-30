@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Omni-Sem evaluation report",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["run_id", "mode", "corpus_size", "query_count", "metrics", "per_query"],
+  "properties": {
+    "run_id": {"type": "string"},
+    "mode": {"type": "string"},
+    "corpus_size": {"type": "integer", "minimum": 0},
+    "query_count": {"type": "integer", "minimum": 0},
+    "metrics": {"type": "object"},
+    "per_query": {"type": "array"}
+  }
+}

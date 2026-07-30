@@ -5,10 +5,14 @@ use std::process::ExitCode as StdExitCode;
 
 use clap::{Parser, Subcommand};
 use omnisem_core::config::{AppConfig, add_root, init_installation, remove_root};
-use omnisem_core::domain::{RootId, Timestamp, parse_duration_to_millis};
-use omnisem_core::error::{ConfigError, ExitCode, IndexError};
+use omnisem_core::domain::{
+    RetrievalMode, RetrievalQuery, RootId, SupportedFileType, Timestamp, parse_duration_to_millis,
+};
+use omnisem_core::error::{ConfigError, ExitCode, IndexError, RetrievalError};
+use omnisem_core::eval::run_evaluation;
 use omnisem_core::index::{IndexReport, index_roots};
 use omnisem_core::paths::AppPaths;
+use omnisem_core::retrieval::{resolve_budget_args, retrieve};
 use omnisem_core::storage::{
     RootRemovalCounts, count_active_sources, delete_root_derived, list_changes, open_database,
     status_snapshot,
@@ -60,6 +64,38 @@ enum Command {
         since: Option<String>,
         #[arg(long)]
         root: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Lexical retrieval over the active index.
+    Query {
+        /// Natural-language query text.
+        query: String,
+        #[arg(long, default_value = "auto")]
+        mode: String,
+        #[arg(long)]
+        root: Option<String>,
+        #[arg(long = "file-type")]
+        file_type: Option<String>,
+        #[arg(long)]
+        limit: Option<u16>,
+        #[arg(long = "token-budget")]
+        token_budget: Option<u32>,
+        #[arg(long)]
+        budget: Option<String>,
+        #[arg(long = "include-sensitive")]
+        include_sensitive: bool,
+        #[arg(long)]
+        explain: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run isolated retrieval evaluation against a fixture bundle.
+    Eval {
+        #[arg(long)]
+        corpus: Option<PathBuf>,
+        #[arg(long, default_value = "lexical")]
+        mode: String,
         #[arg(long)]
         json: bool,
     },
@@ -115,6 +151,31 @@ fn run() -> Result<ExitCode, ExitCode> {
         Some(Command::Changes { since, root, json }) => {
             cmd_changes(&paths, since.as_deref(), root.as_deref(), json)
         }
+        Some(Command::Query {
+            query,
+            mode,
+            root,
+            file_type,
+            limit,
+            token_budget,
+            budget,
+            include_sensitive,
+            explain,
+            json,
+        }) => cmd_query(
+            &paths,
+            &query,
+            &mode,
+            root.as_deref(),
+            file_type.as_deref(),
+            limit,
+            token_budget,
+            budget.as_deref(),
+            include_sensitive,
+            explain,
+            json,
+        ),
+        Some(Command::Eval { corpus, mode, json }) => cmd_eval(corpus.as_deref(), &mode, json),
     }
 }
 
@@ -131,6 +192,11 @@ fn print_config_err(error: &ConfigError) -> ExitCode {
 }
 
 fn print_index_err(error: &IndexError) -> ExitCode {
+    eprintln!("error: {error}");
+    error.exit_code()
+}
+
+fn print_retrieval_err(error: &RetrievalError) -> ExitCode {
     eprintln!("error: {error}");
     error.exit_code()
 }
@@ -483,6 +549,167 @@ fn cmd_changes(
     Ok(ExitCode::Success)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn cmd_query(
+    paths: &AppPaths,
+    query: &str,
+    mode: &str,
+    root: Option<&str>,
+    file_type: Option<&str>,
+    limit: Option<u16>,
+    token_budget: Option<u32>,
+    budget: Option<&str>,
+    include_sensitive: bool,
+    explain: bool,
+    json: bool,
+) -> Result<ExitCode, ExitCode> {
+    let config = load_or_init(paths).map_err(|error| print_config_err(&error))?;
+    let database_path = config
+        .database_path()
+        .map_err(|error| print_config_err(&error))?;
+    let connection = open_database(&database_path).map_err(|error| {
+        eprintln!("error: {error}");
+        ExitCode::Database
+    })?;
+    let mode = mode.parse::<RetrievalMode>().map_err(|error| {
+        eprintln!("error: {error}");
+        ExitCode::InvalidInput
+    })?;
+    let root_ids = match root {
+        None => Vec::new(),
+        Some(value) => {
+            let id = value.parse::<RootId>().map_err(|error| {
+                eprintln!("error: {error}");
+                ExitCode::InvalidInput
+            })?;
+            vec![id]
+        }
+    };
+    let file_types = match file_type {
+        None => Vec::new(),
+        Some(value) => {
+            let parsed = value.parse::<SupportedFileType>().map_err(|error| {
+                eprintln!("error: {error}");
+                ExitCode::InvalidInput
+            })?;
+            vec![parsed]
+        }
+    };
+    let (limit, token_budget, preset) = resolve_budget_args(&config, budget, limit, token_budget)
+        .map_err(|error| print_retrieval_err(&error))?;
+    let request = RetrievalQuery {
+        query: query.to_owned(),
+        root_ids,
+        file_types,
+        mode,
+        limit,
+        token_budget,
+        include_sensitive,
+        budget_preset: preset,
+    };
+    let response =
+        retrieve(&connection, &config, &request).map_err(|error| print_retrieval_err(&error))?;
+    if json {
+        print_json(&QueryEnvelope {
+            schema_version: 1,
+            response,
+        })
+        .map_err(|error| print_config_err(&error))?;
+    } else if response.results.is_empty() {
+        println!("No matches.");
+        println!(
+            "mode={} limit={} budget={} elapsed_ms={}",
+            response.mode.as_str(),
+            response.applied_limit,
+            response.applied_token_budget,
+            response.elapsed_ms
+        );
+    } else {
+        for (index, hit) in response.results.iter().enumerate() {
+            println!(
+                "{}. {}#{}  score={:.4}  freshness={}  tokens={}",
+                index + 1,
+                hit.relative_path.display(),
+                hit.anchor,
+                hit.score,
+                hit.freshness.as_str(),
+                hit.token_estimate
+            );
+            println!("   revision={}", hit.revision_id);
+            if let Some(scope) = hit.sensitivity_scope {
+                println!("   sensitivity={}", scope.as_str());
+            }
+            println!("   {}", hit.text.replace('\n', " "));
+            if explain {
+                println!(
+                    "   matched_terms={}",
+                    hit.explanation.matched_terms.join(", ")
+                );
+                if let Some(excerpt) = &hit.explanation.matched_excerpt {
+                    println!("   excerpt={}", excerpt.replace('\n', " "));
+                }
+            }
+        }
+        println!(
+            "mode={} results={} tokens={} duplicates_suppressed={} truncated={} elapsed_ms={}",
+            response.mode.as_str(),
+            response.results.len(),
+            response.token_estimate,
+            response.duplicates_suppressed,
+            response.truncated,
+            response.elapsed_ms
+        );
+    }
+    Ok(ExitCode::Success)
+}
+
+fn cmd_eval(corpus: Option<&Path>, mode: &str, json: bool) -> Result<ExitCode, ExitCode> {
+    let mode = mode.parse::<RetrievalMode>().map_err(|error| {
+        eprintln!("error: {error}");
+        ExitCode::InvalidInput
+    })?;
+    let bundle = if let Some(path) = corpus {
+        path.to_path_buf()
+    } else {
+        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+        if dev.exists() {
+            dev
+        } else {
+            PathBuf::from("evals")
+        }
+    };
+    let report = run_evaluation(&bundle, mode).map_err(|error| print_retrieval_err(&error))?;
+    if json {
+        print_json(&report).map_err(|error| print_config_err(&error))?;
+    } else {
+        println!("run_id={}", report.run_id);
+        println!(
+            "mode={} corpus={} queries={}",
+            report.mode, report.corpus_size, report.query_count
+        );
+        println!(
+            "recall@5={:.3} recall@10={:.3} mrr={:.3} ndcg={:.3}",
+            report.metrics.recall_at_5,
+            report.metrics.recall_at_10,
+            report.metrics.mrr,
+            report.metrics.ndcg
+        );
+        println!(
+            "dup={:.3} stale={:.3} misleading={:.3} diversity={:.3} tokens={:.1}",
+            report.metrics.duplicate_result_rate,
+            report.metrics.stale_result_rate,
+            report.metrics.misleading_result_rate,
+            report.metrics.source_diversity,
+            report.metrics.returned_tokens
+        );
+        println!(
+            "p50_ms={:.2} p95_ms={:.2}",
+            report.metrics.p50_latency_ms, report.metrics.p95_latency_ms
+        );
+    }
+    Ok(ExitCode::Success)
+}
+
 fn load_or_init(paths: &AppPaths) -> Result<AppConfig, ConfigError> {
     if paths.config_file.exists() {
         AppConfig::load(&paths.config_file)
@@ -530,6 +757,12 @@ struct RootRemoveOutput {
     name: String,
     path: String,
     removed: RootRemovalCounts,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryEnvelope {
+    schema_version: u32,
+    response: omnisem_core::domain::RetrievalResponse,
 }
 
 #[derive(Debug, Serialize)]

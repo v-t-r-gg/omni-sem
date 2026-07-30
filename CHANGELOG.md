@@ -6,14 +6,12 @@ All notable changes will be documented here. The format follows Keep a Changelog
 
 ### Added
 
-- Operational Milestone 1 indexing CLI: `init`, `root add|list|suggest|remove`, `index`, `status`, `changes`.
-- TOML configuration with platform-aware directories, unknown-field denial, and restrictive permissions.
-- Schema v2 migration: timestamps, sensitivity storage, scan runs, and active-only FTS5.
-- BLAKE3 content hashing (`blake3:<hex>`), stable bounded reads, immutable revision promotion.
-- Deletion handling after successful root discovery; root revocation cascade for derived data.
-- ADR-0013 (FTS active surface) and ADR-0014 (BLAKE3 hashing).
-- CLI reference documentation and expanded integration tests.
+- Milestone 2 lexical retrieval: safe query parsing, FTS5 BM25 ranking, match explanations, freshness status, sensitivity-aware CLI filtering, duplicate suppression, token budgeting, and context packing.
+- Named budget presets (`small`, `standard`, `large`) in configuration.
+- `omnisem query` with `--mode`, `--root`, `--file-type`, `--limit`, `--token-budget`, `--budget`, `--include-sensitive`, `--explain`, and `--json`.
+- `omnisem eval` isolated evaluation runner with Recall@k, MRR, nDCG, diversity, duplicate/stale/misleading rates, and p50/p95 latency.
+- Retrieval domain contract extensions and documentation.
 
 ### Previously
 
-- Blueprint v0.3, discovery, Markdown/plain-text parsers, ADR-0007–0012, foundation workspace.
+- Milestone 1 operational indexing CLI, schema v2, FTS5 active surface, discovery, and parsers.
