@@ -16,7 +16,10 @@ That command checks formatting, strict Clippy lints, all tests/features, documen
 
 Keep source behavior deterministic and derived state rebuildable. Add typed validation at boundaries. Record meaningful dependency or architecture changes in an ADR with problem, alternatives, outcome, and consequences. Never use real private documents as fixtures.
 
+## Current capability
+
+The library can discover supported files under an approved root and parse Markdown or plain-text sources into validated segments. The CLI still exposes only foundation `status` help; operational `index`, configuration loading, SQLite revision persistence, FTS, retrieval, and MCP are not implemented.
+
 ## Exit-code contract
 
-The future CLI reserves categories: 0 success, 2 invalid input, 3 configuration, 4 filesystem, 5 database, 6 partial indexing, 7 protocol, and 70 internal error. Milestone 0 exposes only Clap's input handling and successful shell commands; implementation and tests of stable mapping belong to operational commands.
-
+The future CLI reserves categories: 0 success, 2 invalid input, 3 configuration, 4 filesystem, 5 database, 6 partial indexing, 7 protocol, and 70 internal error. The CLI currently exposes only Clap's input handling and successful shell commands; implementation and tests of stable mapping belong to operational commands.

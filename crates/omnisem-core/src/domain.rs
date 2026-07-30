@@ -1,6 +1,7 @@
 //! Storage-independent domain types.
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -39,10 +40,70 @@ identifier!(SourceFileId);
 identifier!(RevisionId);
 identifier!(SegmentId);
 
+/// Coordinated Universal Time as milliseconds since the Unix epoch.
+///
+/// Domain and configuration boundaries use this representation so timestamps stay
+/// serializable without binding the domain to a clock or time crate. Filesystem
+/// metadata is converted at the discovery boundary. `SQLite` persistence of these
+/// values is deferred to the schema-alignment slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Timestamp(i64);
+
+impl Timestamp {
+    /// Creates a timestamp from milliseconds since the Unix epoch.
+    #[must_use]
+    pub const fn from_millis(millis: i64) -> Self {
+        Self(millis)
+    }
+
+    /// Returns milliseconds since the Unix epoch.
+    #[must_use]
+    pub const fn as_millis(self) -> i64 {
+        self.0
+    }
+
+    /// Converts a filesystem `SystemTime` into a domain timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidTimestamp`] when the time is before the Unix
+    /// epoch or cannot be represented as an `i64` millisecond offset.
+    pub fn try_from_system_time(time: SystemTime) -> Result<Self, DomainError> {
+        let duration = time
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| DomainError::InvalidTimestamp)?;
+        let millis =
+            i64::try_from(duration.as_millis()).map_err(|_| DomainError::InvalidTimestamp)?;
+        Ok(Self(millis))
+    }
+}
+
 /// Validated content digest including its algorithm prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ContentHash(pub String);
+
+/// How a sensitivity tag constrains later retrieval visibility.
+///
+/// Sensitivity never controls whether content is indexed. Exclusion patterns alone
+/// decide indexing. These scopes gate whether already-indexed content may be
+/// returned through MCP or ordinary retrieval once those surfaces exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensitivityScope {
+    /// Indexed content must never appear in MCP responses.
+    NeverReturnToMcp,
+    /// Indexed content may be returned only when a request explicitly opts in.
+    RequireExplicitQuery,
+}
+
+/// Root-level pattern that marks matching paths as sensitive for retrieval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SensitivityTag {
+    pub pattern: String,
+    pub scope: SensitivityScope,
+}
 
 /// An explicitly approved local filesystem root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,25 +113,33 @@ pub struct Root {
     pub display_name: String,
     pub include_patterns: Vec<String>,
     pub exclude_patterns: Vec<String>,
+    pub sensitivity_tags: Vec<SensitivityTag>,
     pub follow_symlinks: bool,
     pub enabled: bool,
 }
 
 /// A supported document found during discovery.
+///
+/// This is discovery metadata only. Persistence row mappings belong in storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveredDocument {
     pub root_id: RootId,
     pub canonical_path: PathBuf,
     pub relative_path: PathBuf,
     pub size_bytes: u64,
+    pub modified_at: Timestamp,
     pub file_type: SupportedFileType,
 }
 
 /// File formats understood by the current build.
+///
+/// `Markdown` is structure-aware. `PlainText` is the deterministic fallback for
+/// valid textual files that no structured parser claims. It is not code-aware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SupportedFileType {
     Markdown,
+    PlainText,
 }
 
 /// Current state of a discovered source file.
@@ -92,6 +161,7 @@ pub struct SourceFile {
     pub relative_path: PathBuf,
     pub canonical_path_hash: ContentHash,
     pub size_bytes: u64,
+    pub modified_at: Option<Timestamp>,
     pub current_revision_id: Option<RevisionId>,
     pub state: SourceState,
 }
@@ -244,11 +314,17 @@ pub enum DomainError {
     InvalidRetrievalLimit,
     #[error("token budget must be greater than zero")]
     InvalidTokenBudget,
+    #[error("timestamp is outside the representable Unix-millisecond range")]
+    InvalidTimestamp,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RetrievalLimit, TokenBudget};
+    use super::{
+        DomainError, RetrievalLimit, SensitivityScope, SensitivityTag, SupportedFileType,
+        Timestamp, TokenBudget,
+    };
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn budgets_reject_zero() {
@@ -260,5 +336,35 @@ mod tests {
     fn budgets_preserve_valid_values() {
         assert_eq!(RetrievalLimit::new(8).unwrap().get(), 8);
         assert_eq!(TokenBudget::new(4_000).unwrap().get(), 4_000);
+    }
+
+    #[test]
+    fn timestamp_round_trips_system_time_millis() {
+        let system = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        let stamp = Timestamp::try_from_system_time(system).unwrap();
+        assert_eq!(stamp.as_millis(), 1_700_000_000_123);
+        assert_eq!(Timestamp::from_millis(42).as_millis(), 42);
+    }
+
+    #[test]
+    fn timestamp_rejects_pre_epoch() {
+        let pre_epoch = UNIX_EPOCH - Duration::from_secs(1);
+        assert_eq!(
+            Timestamp::try_from_system_time(pre_epoch),
+            Err(DomainError::InvalidTimestamp)
+        );
+    }
+
+    #[test]
+    fn sensitivity_is_distinct_from_file_classification() {
+        let tag = SensitivityTag {
+            pattern: "**/private/**".into(),
+            scope: SensitivityScope::NeverReturnToMcp,
+        };
+        assert_eq!(tag.scope, SensitivityScope::NeverReturnToMcp);
+        assert_ne!(
+            format!("{:?}", SupportedFileType::Markdown),
+            format!("{:?}", SupportedFileType::PlainText)
+        );
     }
 }

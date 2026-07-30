@@ -1,12 +1,14 @@
 # Omni-Sem
 
-Omni-Sem is a local-first, read-only semantic indexing service for AI agents. It is currently in its project-foundation phase: the repository contains domain, parser, persistence, and evaluation contracts, but does not yet index user files.
+Omni-Sem is a local-first, read-only semantic indexing service for AI agents.
 
-The first operational pipeline will be:
+The repository currently implements the first Milestone 1 **input pipeline** slice under Development Blueprint v0.3:
 
 ```text
-Approved Markdown → immutable revisions → structure-aware segments → SQLite FTS5 → bounded retrieval → read-only MCP
+Approved root → ignore-aware discovery → Markdown | plain-text parse → validated segments
 ```
+
+It does **not** yet index into SQLite, build FTS, retrieve context, or expose MCP. The CLI foundation command remains `status` only.
 
 ## Development
 
@@ -17,13 +19,12 @@ Install stable Rust 1.85 or newer, then run:
 cargo run -p omnisem-cli -- --help
 ```
 
-No root is added and no source file is read automatically. See [development](docs/development.md), [architecture](docs/architecture.md), and [security](SECURITY.md) for the current contracts.
+No root is added and no source file is read automatically by the CLI. Library discovery and parsers are available for the next indexing slice. See [development](docs/development.md), [architecture](docs/architecture.md), [blueprint v0.3](docs/OMNI_SEM_DEVELOPMENT_BLUEPRINT_v0.3.MD), and [security](SECURITY.md).
 
 ## Status
 
-Pre-alpha, Milestone 0. Daemon, watcher, MCP transport, embeddings, graph functionality, and source-file mutation are deliberately absent.
+Pre-alpha, Milestone 1 input-pipeline slice. Configuration CLI, immutable revision persistence, FTS5, retrieval, MCP, daemon, watcher, and embeddings are deliberately absent.
 
 ## License
 
 Licensed under Apache License 2.0. See [LICENSE](LICENSE).
-
