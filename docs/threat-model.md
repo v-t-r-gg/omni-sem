@@ -8,19 +8,29 @@ Source content and the derived database are sensitive. Filesystem contents and f
 
 - path traversal, symlink escape, races, special-file reads;
 - broad roots or secret files entering the index;
+- weaker incremental indexing path that bypasses discovery policy;
+- undecodable Git paths silently dropping deletions/renames;
 - stale/partial revisions appearing active;
-- source text leakage through logs, errors, or status output;
-- resource exhaustion from large files or unbounded suggestion scans;
-- residual FTS rows after root revocation.
+- source text leakage through logs, errors, status HTTP, or snapshot metadata display;
+- malicious or corrupted snapshot trees (symlinks, oversized entries, forged counts);
+- orphan managed payloads or path deletion outside the managed snapshots directory;
+- resource exhaustion from large files, unbounded suggestion scans, or many federated snapshots;
+- residual FTS rows after root revocation; snapshot evidence remaining after root disable/remove.
 
 ## Controls in this release
 
 - explicit root approval and revocation;
 - `init` and `root suggest` never index or auto-approve;
 - canonical containment, default no symlink following, special-file skips;
+- **shared** `validate_relative_path` for full discovery and Git incremental selection;
+- non-UTF-8 Git paths abort incremental collection → full safe fallback (no partial deletes);
 - size limits at discovery and stable read;
 - metadata double-check during reads (`FILE_CHANGED_DURING_READ`);
 - restrictive config/database permissions on Unix;
 - transactional revision/FTS promotion and root cascade cleanup;
-- errors and CLI output avoid source text;
-- sensitivity tags are stored for later retrieval filtering, not treated as exclusions.
+- snapshot tree inspection without following symlinks; integrity + relationship validation beyond checksum;
+- compensating import atomicity; remove only managed payload paths under the snapshots directory;
+- snapshot federation caps (snapshots/candidates) and read-only payload opens;
+- errors and CLI/status output avoid source text and absolute managed paths;
+- status HTTP: loopback bind, method enforcement, header limits, generic 500s, security headers;
+- sensitivity tags gate retrieval visibility, including imported snapshot relative paths.

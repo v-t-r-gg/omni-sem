@@ -10,9 +10,15 @@ use omnisem_core::domain::{
 };
 use omnisem_core::error::{ConfigError, ExitCode, IndexError, RetrievalError};
 use omnisem_core::eval::run_evaluation;
-use omnisem_core::index::{IndexReport, index_roots};
+use omnisem_core::index::{IndexOptions, IndexReport, index_roots_with_options};
 use omnisem_core::paths::AppPaths;
 use omnisem_core::retrieval::{resolve_budget_args, retrieve};
+use omnisem_core::snapshot::{
+    export_snapshot, import_snapshot, inspect_snapshot, list_snapshots, parse_root_maps,
+    remove_snapshot,
+};
+use omnisem_core::status_server::serve_status;
+use omnisem_core::storage::record_query_activity;
 use omnisem_core::storage::{
     RootRemovalCounts, count_active_sources, delete_root_derived, list_changes, open_database,
     status_snapshot,
@@ -50,13 +56,25 @@ enum Command {
     Index {
         #[arg(long)]
         root: Option<String>,
+        /// Git-aware incremental indexing. Optional revision value uses last recorded base when omitted.
+        #[arg(long, num_args = 0..=1, default_missing_value = "__LAST__")]
+        since: Option<String>,
         #[arg(long)]
         json: bool,
     },
-    /// Show operational index status.
+    /// Show operational index status or serve a local read-only HTTP view.
     Status {
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        serve: bool,
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+    },
+    /// Export or import portable derived-data snapshots.
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotCommand,
     },
     /// Show addition, modification, and deletion history.
     Changes {
@@ -96,6 +114,44 @@ enum Command {
         corpus: Option<PathBuf>,
         #[arg(long, default_value = "lexical")]
         mode: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotCommand {
+    /// Export a sensitive derived-data snapshot directory.
+    Export {
+        path: PathBuf,
+        #[arg(long)]
+        root: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import a snapshot after explicit root mapping.
+    Import {
+        path: PathBuf,
+        /// Mapping `SNAPSHOT_ROOT_ID=LOCAL_ROOT_ID` (repeatable).
+        #[arg(long = "map")]
+        map: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List registered snapshots.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one registered snapshot.
+    Inspect {
+        snapshot_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a registered snapshot and its managed payload.
+    Remove {
+        snapshot_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -146,8 +202,11 @@ fn run() -> Result<ExitCode, ExitCode> {
             cmd_init(&paths, json).map_err(|error| print_config_err(&error))
         }
         Some(Command::Root { action }) => cmd_root(&paths, action),
-        Some(Command::Index { root, json }) => cmd_index(&paths, root.as_deref(), json),
-        Some(Command::Status { json }) => cmd_status(&paths, json),
+        Some(Command::Index { root, since, json }) => {
+            cmd_index(&paths, root.as_deref(), since, json)
+        }
+        Some(Command::Status { json, serve, port }) => cmd_status(&paths, json, serve, port),
+        Some(Command::Snapshot { action }) => cmd_snapshot(&paths, action),
         Some(Command::Changes { since, root, json }) => {
             cmd_changes(&paths, since.as_deref(), root.as_deref(), json)
         }
@@ -386,7 +445,12 @@ fn cmd_root_remove(paths: &AppPaths, root_id: &str, json: bool) -> Result<ExitCo
     Ok(ExitCode::Success)
 }
 
-fn cmd_index(paths: &AppPaths, root: Option<&str>, json: bool) -> Result<ExitCode, ExitCode> {
+fn cmd_index(
+    paths: &AppPaths,
+    root: Option<&str>,
+    since: Option<String>,
+    json: bool,
+) -> Result<ExitCode, ExitCode> {
     let config = load_or_init(paths).map_err(|error| print_config_err(&error))?;
     let database_path = config
         .database_path()
@@ -402,7 +466,16 @@ fn cmd_index(paths: &AppPaths, root: Option<&str>, json: bool) -> Result<ExitCod
             eprintln!("error: {error}");
             ExitCode::InvalidInput
         })?;
-    let report = index_roots(&mut connection, &config, filter.as_ref())
+    let options = IndexOptions {
+        since: since.map(|value| {
+            if value == "__LAST__" {
+                None
+            } else {
+                Some(value)
+            }
+        }),
+    };
+    let report = index_roots_with_options(&mut connection, &config, filter.as_ref(), &options)
         .map_err(|error| print_index_err(&error))?;
     if json {
         print_json(&report).map_err(|error| print_config_err(&error))?;
@@ -417,6 +490,17 @@ fn cmd_index(paths: &AppPaths, root: Option<&str>, json: bool) -> Result<ExitCod
 }
 
 fn print_index_human(report: &IndexReport) {
+    for root in &report.root_reports {
+        println!(
+            "root {} mode={:?} base={:?} head={:?} changed={} fallback={:?}",
+            root.root_name,
+            root.mode,
+            root.resolved_base,
+            root.current_head,
+            root.changed_paths,
+            root.fallback_reason
+        );
+    }
     println!("roots scanned: {}", report.roots_scanned);
     println!("files discovered: {}", report.files_discovered);
     println!("additions: {}", report.additions);
@@ -429,7 +513,7 @@ fn print_index_human(report: &IndexReport) {
     println!("duration_ms: {}", report.duration_ms);
 }
 
-fn cmd_status(paths: &AppPaths, json: bool) -> Result<ExitCode, ExitCode> {
+fn cmd_status(paths: &AppPaths, json: bool, serve: bool, port: u16) -> Result<ExitCode, ExitCode> {
     let config = load_or_init(paths).map_err(|error| print_config_err(&error))?;
     let database_path = config
         .database_path()
@@ -438,6 +522,16 @@ fn cmd_status(paths: &AppPaths, json: bool) -> Result<ExitCode, ExitCode> {
         eprintln!("error: {error}");
         ExitCode::Database
     })?;
+    if serve {
+        drop(connection);
+        let server =
+            serve_status(&database_path, port).map_err(|error| print_config_err(&error))?;
+        println!("Omni-Sem status listening on http://{}/", server.addr());
+        println!("Read-only local view. Press Ctrl+C to stop.");
+        loop {
+            std::thread::park();
+        }
+    }
     let snapshot = status_snapshot(&connection, &database_path).map_err(|error| {
         eprintln!("error: {error}");
         ExitCode::Database
@@ -549,7 +643,7 @@ fn cmd_changes(
     Ok(ExitCode::Success)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn cmd_query(
     paths: &AppPaths,
     query: &str,
@@ -609,6 +703,14 @@ fn cmd_query(
     };
     let response =
         retrieve(&connection, &config, &request).map_err(|error| print_retrieval_err(&error))?;
+    let _ = record_query_activity(
+        &connection,
+        omnisem_core::domain::Timestamp::now()
+            .map_or(0, omnisem_core::domain::Timestamp::as_millis),
+        response.mode.as_str(),
+        i64::try_from(response.results.len()).unwrap_or(0),
+        i64::try_from(response.elapsed_ms).unwrap_or(0),
+    );
     if json {
         print_json(&QueryEnvelope {
             schema_version: 1,
@@ -626,14 +728,21 @@ fn cmd_query(
         );
     } else {
         for (index, hit) in response.results.iter().enumerate() {
+            let origin = match &hit.origin {
+                omnisem_core::domain::EvidenceOrigin::LocalIndex => "local".to_owned(),
+                omnisem_core::domain::EvidenceOrigin::Snapshot { snapshot_id, .. } => {
+                    format!("snapshot:{snapshot_id}")
+                }
+            };
             println!(
-                "{}. {}#{}  score={:.4}  freshness={}  tokens={}",
+                "{}. {}#{}  score={:.4}  freshness={}  tokens={}  origin={}",
                 index + 1,
                 hit.relative_path.display(),
                 hit.anchor,
                 hit.score,
                 hit.freshness.as_str(),
-                hit.token_estimate
+                hit.token_estimate,
+                origin
             );
             println!("   revision={}", hit.revision_id);
             if let Some(scope) = hit.sensitivity_scope {
@@ -708,6 +817,124 @@ fn cmd_eval(corpus: Option<&Path>, mode: &str, json: bool) -> Result<ExitCode, E
         );
     }
     Ok(ExitCode::Success)
+}
+
+#[allow(clippy::too_many_lines)]
+fn cmd_snapshot(paths: &AppPaths, action: SnapshotCommand) -> Result<ExitCode, ExitCode> {
+    let config = load_or_init(paths).map_err(|error| print_config_err(&error))?;
+    let database_path = config
+        .database_path()
+        .map_err(|error| print_config_err(&error))?;
+    match action {
+        SnapshotCommand::Export { path, root, json } => {
+            let mut connection = open_database(&database_path).map_err(|error| {
+                eprintln!("error: {error}");
+                ExitCode::Database
+            })?;
+            let filter = root
+                .as_deref()
+                .map(str::parse::<RootId>)
+                .transpose()
+                .map_err(|error| {
+                    eprintln!("error: {error}");
+                    ExitCode::InvalidInput
+                })?;
+            let report = export_snapshot(&connection, &path, filter.as_ref())
+                .map_err(|error| print_config_err(&error))?;
+            eprintln!(
+                "warning: snapshot contains derived indexed text and may include substantially all approved corpus content"
+            );
+            if json {
+                print_json(&report).map_err(|error| print_config_err(&error))?;
+            } else {
+                println!("exported snapshot to {}", report.path);
+                println!(
+                    "segments={} checksum={}",
+                    report.segments, report.payload_checksum
+                );
+            }
+            let _ = &mut connection;
+            Ok(ExitCode::Success)
+        }
+        SnapshotCommand::Import { path, map, json } => {
+            let mut connection = open_database(&database_path).map_err(|error| {
+                eprintln!("error: {error}");
+                ExitCode::Database
+            })?;
+            let maps = parse_root_maps(&map).map_err(|error| print_config_err(&error))?;
+            let report = import_snapshot(&mut connection, &path, &maps)
+                .map_err(|error| print_config_err(&error))?;
+            if json {
+                print_json(&report).map_err(|error| print_config_err(&error))?;
+            } else {
+                println!("imported snapshot {}", report.snapshot_id);
+                println!("maps: {}", report.mapped_roots.join(", "));
+            }
+            Ok(ExitCode::Success)
+        }
+        SnapshotCommand::List { json } => {
+            let connection = open_database(&database_path).map_err(|error| {
+                eprintln!("error: {error}");
+                ExitCode::Database
+            })?;
+            let items = list_snapshots(&connection).map_err(|error| print_config_err(&error))?;
+            if json {
+                print_json(&items).map_err(|error| print_config_err(&error))?;
+            } else if items.is_empty() {
+                println!("No snapshots registered.");
+            } else {
+                for item in items {
+                    println!(
+                        "{}  {}  queryable={} healthy={} segments={} maps={}/{}",
+                        item.snapshot_id,
+                        item.logical_name,
+                        item.queryable,
+                        item.payload_healthy,
+                        item.segment_count,
+                        item.mapped_roots,
+                        item.total_roots
+                    );
+                }
+            }
+            Ok(ExitCode::Success)
+        }
+        SnapshotCommand::Inspect { snapshot_id, json } => {
+            let connection = open_database(&database_path).map_err(|error| {
+                eprintln!("error: {error}");
+                ExitCode::Database
+            })?;
+            let item = inspect_snapshot(&connection, &snapshot_id)
+                .map_err(|error| print_config_err(&error))?;
+            if json {
+                print_json(&item).map_err(|error| print_config_err(&error))?;
+            } else {
+                println!("snapshot {}", item.snapshot_id);
+                println!(
+                    "queryable={} healthy={}",
+                    item.queryable, item.payload_healthy
+                );
+                println!("segments={}", item.counts.segments);
+                println!("mappings: {}", item.mappings.join(", "));
+                println!("{}", item.warning);
+            }
+            Ok(ExitCode::Success)
+        }
+        SnapshotCommand::Remove { snapshot_id, json } => {
+            let mut connection = open_database(&database_path).map_err(|error| {
+                eprintln!("error: {error}");
+                ExitCode::Database
+            })?;
+            let report = remove_snapshot(&mut connection, &snapshot_id)
+                .map_err(|error| print_config_err(&error))?;
+            if json {
+                print_json(&report).map_err(|error| print_config_err(&error))?;
+            } else {
+                println!("removed snapshot {}", report.snapshot_id);
+                println!("segments_were={}", report.segments);
+            }
+            Ok(ExitCode::Success)
+        }
+    }
 }
 
 fn load_or_init(paths: &AppPaths) -> Result<AppConfig, ConfigError> {

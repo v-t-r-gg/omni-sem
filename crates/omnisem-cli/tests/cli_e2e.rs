@@ -51,7 +51,7 @@ fn init_root_index_status_changes() {
     let status = run(&["status", "--json"]);
     assert!(status.status.success());
     let body = String::from_utf8_lossy(&status.stdout);
-    assert!(body.contains("\"schema_version\": 2"));
+    assert!(body.contains("\"schema_version\": 3"));
     assert!(body.contains("\"active_source_files\": 2"));
     let changes = run(&["changes", "--json"]);
     assert!(changes.status.success());

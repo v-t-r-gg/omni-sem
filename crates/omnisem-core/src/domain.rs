@@ -565,12 +565,26 @@ pub struct RetrievalQuery {
     pub budget_preset: Option<String>,
 }
 
+/// Provenance of a retrieval hit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvidenceOrigin {
+    LocalIndex,
+    Snapshot {
+        snapshot_id: String,
+        snapshot_root_id: String,
+    },
+}
+
 /// Ranking and channel signals retained for debugging and evaluation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalSignals {
     pub channel: String,
     pub raw_bm25: Option<f32>,
     pub public_score: f32,
+    /// Final federation score when multiple indexes contribute (RRF).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation_score: Option<f32>,
 }
 
 /// Deterministic match explanation without model inference.
@@ -642,6 +656,7 @@ pub struct RetrievalHit {
     pub sensitivity_scope: Option<SensitivityScope>,
     pub token_estimate: u32,
     pub truncated: bool,
+    pub origin: EvidenceOrigin,
 }
 
 /// Normalized response shared by CLI and future protocol adapters.

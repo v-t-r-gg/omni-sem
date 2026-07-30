@@ -7,7 +7,10 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::config::AppConfig;
-use crate::discovery::{DEFAULT_MAX_FILE_SIZE_BYTES, DiscoveryOptions, discover_root};
+use crate::discovery::{
+    DEFAULT_MAX_FILE_SIZE_BYTES, DiscoveryOptions, discover_root, is_safe_relative_path,
+    validate_relative_path,
+};
 use crate::domain::{
     ContentHash, DiscoveredDocument, Revision, RevisionId, RevisionStatus, Root, RootId, ScanRun,
     ScanRunId, ScanStatus, Segment, SegmentId, SourceFile, SourceFileId, SourceState, Timestamp,
@@ -20,6 +23,14 @@ use crate::storage::{
     StorageError, find_source_file, insert_scan_run, list_active_source_files, mark_source_deleted,
     path_hash, promote_revision, upsert_root, upsert_source_file,
 };
+
+/// Indexing mode for a root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexMode {
+    Full,
+    Incremental,
+}
 
 /// Summary of one multi-root indexing invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -42,6 +53,13 @@ pub struct IndexReport {
 pub struct RootIndexReport {
     pub root_id: String,
     pub root_name: String,
+    pub mode: IndexMode,
+    pub requested_base: Option<String>,
+    pub resolved_base: Option<String>,
+    pub current_head: Option<String>,
+    pub changed_paths: u32,
+    pub explicit_deletions: u32,
+    pub fallback_reason: Option<String>,
     pub files_discovered: u32,
     pub additions: u32,
     pub modifications: u32,
@@ -54,6 +72,16 @@ pub struct RootIndexReport {
     pub error_code: Option<String>,
 }
 
+/// Controls indexing behavior for [`index_roots`].
+#[derive(Debug, Clone, Default)]
+pub struct IndexOptions {
+    /// When `Some`, attempt Git-aware incremental indexing.
+    ///
+    /// - `Some(None)` uses the last recorded successful Git base, or full scans when missing.
+    /// - `Some(Some(rev))` uses the supplied revision as the comparison base.
+    pub since: Option<Option<String>>,
+}
+
 /// Indexes all enabled roots or a single selected root.
 ///
 /// # Errors
@@ -64,6 +92,20 @@ pub fn index_roots(
     connection: &mut Connection,
     config: &AppConfig,
     only_root: Option<&RootId>,
+) -> Result<IndexReport, IndexError> {
+    index_roots_with_options(connection, config, only_root, &IndexOptions::default())
+}
+
+/// Indexes roots with optional Git-aware incremental selection.
+///
+/// # Errors
+///
+/// Returns configuration, database, or systemic filesystem failures.
+pub fn index_roots_with_options(
+    connection: &mut Connection,
+    config: &AppConfig,
+    only_root: Option<&RootId>,
+    options: &IndexOptions,
 ) -> Result<IndexReport, IndexError> {
     let started = Instant::now();
     let registry = ParserRegistry::with_defaults().map_err(|error| {
@@ -99,7 +141,35 @@ pub fn index_roots(
     };
 
     for root in roots {
-        let root_report = index_one_root(connection, &root, &registry)?;
+        let root_report = match &options.since {
+            None => {
+                let report =
+                    index_one_root_full(connection, &root, &registry, None, None, None, None)?;
+                // Record Git head after successful full scans so later `--since` has a base.
+                if report.failures == 0 && !report.failed {
+                    if let Some(ctx) = crate::git::detect_git_root(&root.canonical_path) {
+                        let _ = crate::storage::upsert_root_git_state(
+                            connection,
+                            &crate::storage::RootGitState {
+                                root_id: root.id.to_string(),
+                                repo_fingerprint: Some(ctx.repo_fingerprint),
+                                last_indexed_commit: Some(ctx.head.clone()),
+                                observed_head: Some(ctx.head),
+                                last_incremental_base: None,
+                                last_incremental_at_ms: None,
+                            },
+                        );
+                    }
+                }
+                report
+            }
+            Some(requested) => index_one_root_maybe_incremental(
+                connection,
+                &root,
+                &registry,
+                requested.as_deref(),
+            )?,
+        };
         report.roots_scanned += 1;
         report.files_discovered += root_report.files_discovered;
         report.additions += root_report.additions;
@@ -116,10 +186,241 @@ pub fn index_roots(
     Ok(report)
 }
 
-fn index_one_root(
+#[allow(clippy::too_many_lines)]
+fn index_one_root_maybe_incremental(
     connection: &mut Connection,
     root: &Root,
     registry: &ParserRegistry,
+    requested: Option<&str>,
+) -> Result<RootIndexReport, IndexError> {
+    use crate::git::{GitChangeKind, collect_changes, detect_git_root, revision_exists};
+    use crate::storage::{RootGitState, load_root_git_state, upsert_root_git_state};
+
+    let Some(ctx) = detect_git_root(&root.canonical_path) else {
+        return index_one_root_full(
+            connection,
+            root,
+            registry,
+            requested.map(str::to_owned),
+            None,
+            None,
+            Some("not a git repository".into()),
+        );
+    };
+
+    let prior = load_root_git_state(connection, &root.id)?;
+    let resolved_base = match requested {
+        Some(rev) => {
+            if revision_exists(&root.canonical_path, rev) {
+                Some(rev.to_owned())
+            } else {
+                let report = index_one_root_full(
+                    connection,
+                    root,
+                    registry,
+                    Some(rev.to_owned()),
+                    None,
+                    Some(ctx.head.clone()),
+                    Some(format!("git revision unavailable: {rev}")),
+                )?;
+                if report.failures == 0 && !report.failed {
+                    let _ = upsert_root_git_state(
+                        connection,
+                        &RootGitState {
+                            root_id: root.id.to_string(),
+                            repo_fingerprint: Some(ctx.repo_fingerprint.clone()),
+                            last_indexed_commit: Some(ctx.head.clone()),
+                            observed_head: Some(ctx.head.clone()),
+                            last_incremental_base: None,
+                            last_incremental_at_ms: Some(Timestamp::now()?.as_millis()),
+                        },
+                    );
+                }
+                return Ok(report);
+            }
+        }
+        None => prior
+            .as_ref()
+            .and_then(|state| state.last_indexed_commit.clone()),
+    };
+
+    let Some(base) = resolved_base else {
+        let report = index_one_root_full(
+            connection,
+            root,
+            registry,
+            None,
+            None,
+            Some(ctx.head.clone()),
+            Some("no prior git base; performing full scan".into()),
+        )?;
+        if report.failures == 0 && !report.failed {
+            let _ = upsert_root_git_state(
+                connection,
+                &RootGitState {
+                    root_id: root.id.to_string(),
+                    repo_fingerprint: Some(ctx.repo_fingerprint.clone()),
+                    last_indexed_commit: Some(ctx.head.clone()),
+                    observed_head: Some(ctx.head.clone()),
+                    last_incremental_base: None,
+                    last_incremental_at_ms: Some(Timestamp::now()?.as_millis()),
+                },
+            );
+        }
+        return Ok(report);
+    };
+
+    let changes = match collect_changes(&root.canonical_path, &ctx, &base) {
+        Ok(changes) => changes,
+        Err(error) => {
+            let report = index_one_root_full(
+                connection,
+                root,
+                registry,
+                Some(base),
+                None,
+                Some(ctx.head.clone()),
+                Some(format!("git change collection failed: {error}")),
+            )?;
+            // Successful full fallback advances the Git base so a bad base is not retried forever.
+            if report.failures == 0 && !report.failed {
+                let _ = upsert_root_git_state(
+                    connection,
+                    &RootGitState {
+                        root_id: root.id.to_string(),
+                        repo_fingerprint: Some(ctx.repo_fingerprint.clone()),
+                        last_indexed_commit: Some(ctx.head.clone()),
+                        observed_head: Some(ctx.head.clone()),
+                        last_incremental_base: None,
+                        last_incremental_at_ms: Some(Timestamp::now()?.as_millis()),
+                    },
+                );
+            }
+            return Ok(report);
+        }
+    };
+
+    let started_at = Timestamp::now()?;
+    upsert_root(connection, root)?;
+    let mut additions = 0_u32;
+    let mut modifications = 0_u32;
+    let mut unchanged = 0_u32;
+    let mut failures = 0_u32;
+    let mut segments_indexed = 0_u32;
+    let mut explicit_deletions = 0_u32;
+    let mut files_discovered = 0_u32;
+    let discovery_options = DiscoveryOptions::default();
+    let root_canonical = root
+        .canonical_path
+        .canonicalize()
+        .unwrap_or_else(|_| root.canonical_path.clone());
+
+    for change in &changes {
+        if !is_safe_relative_path(&change.relative_path) {
+            continue;
+        }
+        match change.kind {
+            GitChangeKind::Deleted => {
+                if let Some(source) = find_source_file(connection, &root.id, &change.relative_path)?
+                {
+                    mark_source_deleted(connection, &source, Timestamp::now()?)?;
+                    explicit_deletions += 1;
+                }
+            }
+            GitChangeKind::Added | GitChangeKind::Modified => {
+                let validated = validate_relative_path(
+                    root,
+                    &root_canonical,
+                    &change.relative_path,
+                    &discovery_options,
+                )
+                .map_err(|error| IndexError::Internal(error.to_string()))?;
+                let Ok(document) = validated else {
+                    continue;
+                };
+                files_discovered += 1;
+                match process_document(connection, root, &document, registry) {
+                    Ok(DocumentOutcome::Addition { segments }) => {
+                        additions += 1;
+                        segments_indexed += segments;
+                    }
+                    Ok(DocumentOutcome::Modification { segments }) => {
+                        modifications += 1;
+                        segments_indexed += segments;
+                    }
+                    Ok(DocumentOutcome::Unchanged) => unchanged += 1,
+                    Err(_) => failures += 1,
+                }
+            }
+        }
+    }
+
+    if failures == 0 {
+        upsert_root_git_state(
+            connection,
+            &RootGitState {
+                root_id: root.id.to_string(),
+                repo_fingerprint: Some(ctx.repo_fingerprint),
+                last_indexed_commit: Some(ctx.head.clone()),
+                observed_head: Some(ctx.head.clone()),
+                last_incremental_base: Some(base.clone()),
+                last_incremental_at_ms: Some(Timestamp::now()?.as_millis()),
+            },
+        )?;
+    }
+
+    let completed_at = Timestamp::now()?;
+    insert_scan_run(
+        connection,
+        &ScanRun {
+            id: ScanRunId::new(),
+            root_id: root.id,
+            started_at,
+            completed_at: Some(completed_at),
+            status: ScanStatus::Completed,
+            additions,
+            modifications,
+            unchanged,
+            deletions: explicit_deletions,
+            skipped: 0,
+            failures,
+            segments_indexed,
+            error_code: None,
+        },
+    )?;
+
+    Ok(RootIndexReport {
+        root_id: root.id.to_string(),
+        root_name: root.display_name.clone(),
+        mode: IndexMode::Incremental,
+        requested_base: requested.map(str::to_owned),
+        resolved_base: Some(base),
+        current_head: Some(ctx.head),
+        changed_paths: u32::try_from(changes.len()).unwrap_or(u32::MAX),
+        explicit_deletions,
+        fallback_reason: None,
+        files_discovered,
+        additions,
+        modifications,
+        unchanged,
+        deletions: explicit_deletions,
+        skipped: 0,
+        failures,
+        segments_indexed,
+        failed: false,
+        error_code: None,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn index_one_root_full(
+    connection: &mut Connection,
+    root: &Root,
+    registry: &ParserRegistry,
+    requested_base: Option<String>,
+    resolved_base: Option<String>,
+    current_head: Option<String>,
+    fallback_reason: Option<String>,
 ) -> Result<RootIndexReport, IndexError> {
     let started_at = Timestamp::now()?;
     upsert_root(connection, root)?;
@@ -147,6 +448,13 @@ fn index_one_root(
             return Ok(RootIndexReport {
                 root_id: root.id.to_string(),
                 root_name: root.display_name.clone(),
+                mode: IndexMode::Full,
+                requested_base,
+                resolved_base,
+                current_head,
+                changed_paths: 0,
+                explicit_deletions: 0,
+                fallback_reason,
                 files_discovered: 0,
                 additions: 0,
                 modifications: 0,
@@ -216,6 +524,13 @@ fn index_one_root(
     Ok(RootIndexReport {
         root_id: root.id.to_string(),
         root_name: root.display_name.clone(),
+        mode: IndexMode::Full,
+        requested_base,
+        resolved_base,
+        current_head,
+        changed_paths: 0,
+        explicit_deletions: 0,
+        fallback_reason,
         files_discovered: u32::try_from(discovery.documents.len()).unwrap_or(u32::MAX),
         additions,
         modifications,

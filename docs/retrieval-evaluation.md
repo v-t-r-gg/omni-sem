@@ -51,4 +51,16 @@ Row UUIDs are omitted so equivalent corpora fingerprint identically across re-in
 
 ## Isolation
 
-Evaluation always builds a temporary data root and database. The user’s configured index is never modified.
+Evaluation always builds a temporary data root and database. The user’s configured index is never modified. Imported snapshots are **not** part of the default evaluation path; reference lexical metrics remain local-only unless a bundle explicitly includes snapshots.
+
+## Snapshot federation (runtime query, not default eval)
+
+Production `omnisem query` may federate mapped imported snapshots:
+
+- evidence origin is explicit (`local_index` vs `snapshot`);
+- ranking across databases uses RRF (see ADR-0016), not raw multi-DB BM25;
+- local exact `text_hash` duplicates suppress snapshot copies;
+- snapshot freshness is `unknown`;
+- unhealthy snapshot payloads are skipped with bounded warnings.
+
+Targeted integration tests cover federation; they must not contaminate reference lexical metrics.

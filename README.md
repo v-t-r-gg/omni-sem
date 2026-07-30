@@ -2,47 +2,35 @@
 
 Omni-Sem is a local-first, read-only semantic indexing service for AI agents.
 
-## Operational now (Milestone 2)
+## Operational now (Milestone 3)
 
 ```text
 omnisem init
 omnisem root add|list|suggest|remove
-omnisem index
-omnisem status
-omnisem changes
+omnisem index [--since [REVISION]]
 omnisem query
 omnisem eval
+omnisem snapshot export|import|list|inspect|remove
+omnisem status [--serve] [--port N]
+omnisem changes
 ```
 
-Deterministic local **lexical** search is operational:
+Capabilities:
 
-```text
-query → safe FTS5 MATCH → active-segment BM25 ranking
-    → sensitivity filtering → duplicate suppression
-    → freshness inspection → token-budget packing → CLI output
-```
+- deterministic Markdown / plain-text indexing into immutable revisions + active FTS5;
+- lexical retrieval with packing and evaluation;
+- optional Git-aware incremental indexing (`index --since`) using the **same discovery security policy** as full scans;
+- portable sensitive derived-data snapshots with validation, explicit root mapping, lifecycle commands, and **federated lexical retrieval** (RRF) after complete mapping;
+- local loopback read-only status HTTP view with method-aware GET/HEAD contracts.
 
-Evaluation runs against isolated temporary indexes and never mutates the user’s ordinary index.
+Imported snapshots are queryable only after every snapshot root is explicitly mapped to an enabled local root. Local exact text-hash duplicates win over snapshot evidence. Snapshot freshness is always `unknown`. Snapshot payloads contain derived text and must be treated as sensitive.
 
-## Not yet implemented
+## Not yet implemented (Milestone 4+)
 
 - embeddings / semantic / hybrid retrieval
 - MCP
-- `omnisem index --since`
-- snapshots, daemon, watcher, IPC
-- graph features
-
-## Quick start
-
-```bash
-cargo run -p omnisem-cli -- init
-cargo run -p omnisem-cli -- root add ./docs --name docs
-cargo run -p omnisem-cli -- index
-cargo run -p omnisem-cli -- query "storage architecture" --explain
-cargo run -p omnisem-cli -- eval --json
-```
-
-Use `--data-root PATH` to isolate configuration and database files.
+- filesystem watcher / persistent daemon
+- automatic Git hook installation
 
 ## Development
 
@@ -50,7 +38,7 @@ Use `--data-root PATH` to isolate configuration and database files.
 ./scripts/check.sh
 ```
 
-See [docs/development.md](docs/development.md), [docs/cli.md](docs/cli.md), [docs/architecture.md](docs/architecture.md), and the [blueprint](docs/OMNI_SEM_DEVELOPMENT_BLUEPRINT_v0.3.MD).
+See [docs/development.md](docs/development.md), [docs/cli.md](docs/cli.md), and [docs/OMNI_SEM_DEVELOPMENT_BLUEPRINT_v0.3.MD](docs/OMNI_SEM_DEVELOPMENT_BLUEPRINT_v0.3.MD).
 
 ## License
 
