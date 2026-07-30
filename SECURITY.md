@@ -8,5 +8,4 @@ Omni-Sem is pre-alpha and has no supported release. Security reports are still w
 
 Omni-Sem will read only explicitly approved roots. Source documents are immutable and untrusted; derived indexes may contain sensitive text and require the same care as the corpus. The product never claims filename exclusions detect every secret.
 
-Milestone 0 performs no discovery, indexing, networking, model invocation, MCP serving, or source mutation. Future implementations must canonicalize paths, reject root escapes and special files, default to not following symlinks, impose size limits, and keep protocol output separate from logs.
-
+Discovery canonicalizes roots, rejects root escapes and special files, defaults to not following symlinks, honors workspace ignore rules, applies Omni-Sem excludes authoritatively, and enforces a maximum file size. Sensitivity tags are configuration for later retrieval gating; they do not replace exclusion. The CLI still does not mutate sources, open network sockets, or serve MCP.
