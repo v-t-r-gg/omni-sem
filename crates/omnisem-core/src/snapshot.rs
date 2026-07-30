@@ -180,21 +180,7 @@ pub fn import_snapshot(
 ) -> Result<SnapshotImportReport, ConfigError> {
     validate_snapshot_tree(snapshot_dir)?;
     let manifest = read_manifest(snapshot_dir)?;
-    if manifest.snapshot_format_version != SNAPSHOT_FORMAT_VERSION {
-        return Err(ConfigError::Invalid {
-            path: snapshot_dir.to_path_buf(),
-            message: format!(
-                "unsupported snapshot format {}",
-                manifest.snapshot_format_version
-            ),
-        });
-    }
-    if !manifest.embedding_spaces.is_empty() {
-        return Err(ConfigError::Invalid {
-            path: snapshot_dir.to_path_buf(),
-            message: "snapshot declares unknown embedding spaces".into(),
-        });
-    }
+    validate_manifest_compatibility(&manifest, snapshot_dir)?;
     let payload = snapshot_dir.join("payload.sqlite3");
     let bytes = fs::read(&payload).map_err(|error| ConfigError::Io {
         path: payload.clone(),
@@ -212,7 +198,27 @@ pub fn import_snapshot(
             message: "snapshot import requires explicit --map SNAPSHOT_ROOT=LOCAL_ROOT".into(),
         });
     }
+    if maps.len() != manifest.roots.len() {
+        return Err(ConfigError::Invalid {
+            path: snapshot_dir.to_path_buf(),
+            message: "every snapshot root must be mapped exactly once".into(),
+        });
+    }
+    let mut seen_snap = std::collections::HashSet::new();
+    let mut seen_local = std::collections::HashSet::new();
     for (snap_root, local_root) in maps {
+        if !seen_snap.insert(snap_root.clone()) {
+            return Err(ConfigError::Invalid {
+                path: snapshot_dir.to_path_buf(),
+                message: format!("duplicate mapping for snapshot root {snap_root}"),
+            });
+        }
+        if !seen_local.insert(local_root.clone()) {
+            return Err(ConfigError::Invalid {
+                path: snapshot_dir.to_path_buf(),
+                message: format!("duplicate local root mapping {local_root}"),
+            });
+        }
         if !manifest
             .roots
             .iter()
@@ -223,10 +229,30 @@ pub fn import_snapshot(
                 message: format!("unknown snapshot root id {snap_root}"),
             });
         }
-        let _ = local_root
+        let local_id = local_root
             .parse::<RootId>()
             .map_err(|_| ConfigError::RootNotFound(local_root.clone()))?;
+        let enabled: Option<i64> = connection
+            .query_row(
+                "SELECT enabled FROM roots WHERE id = ?1",
+                params![local_id.to_string()],
+                |row| row.get(0),
+            )
+            .ok();
+        match enabled {
+            Some(1) => {}
+            Some(_) => {
+                return Err(ConfigError::Invalid {
+                    path: snapshot_dir.to_path_buf(),
+                    message: format!("local root is disabled: {local_root}"),
+                });
+            }
+            None => {
+                return Err(ConfigError::RootNotFound(local_root.clone()));
+            }
+        }
     }
+    validate_payload_database(&payload, &manifest)?;
 
     let snapshot_id = uuid::Uuid::new_v4().to_string();
     let data_dir = snapshot_dir
@@ -254,11 +280,19 @@ pub fn import_snapshot(
         message: error.to_string(),
     })?;
     let stored_payload = store_parent.join(format!("{snapshot_id}.sqlite3"));
-    fs::copy(&payload, &stored_payload).map_err(|error| ConfigError::Io {
-        path: stored_payload.clone(),
-        message: error.to_string(),
-    })?;
-    restrict_permissions(&stored_payload)?;
+    let temp_payload = store_parent.join(format!(".{snapshot_id}.tmp"));
+    if let Err(error) = (|| -> Result<(), ConfigError> {
+        fs::copy(&payload, &temp_payload).map_err(|error| ConfigError::Io {
+            path: temp_payload.clone(),
+            message: error.to_string(),
+        })?;
+        restrict_permissions(&temp_payload)?;
+        validate_payload_database(&temp_payload, &manifest)?;
+        Ok(())
+    })() {
+        let _ = fs::remove_file(&temp_payload);
+        return Err(error);
+    }
     let manifest_json = serde_json::to_string(&manifest).map_err(|error| ConfigError::Invalid {
         path: snapshot_dir.to_path_buf(),
         message: error.to_string(),
@@ -271,30 +305,56 @@ pub fn import_snapshot(
             "imported",
             i64::from(SNAPSHOT_FORMAT_VERSION),
             Timestamp::now().map_or(0, Timestamp::as_millis),
-            stored_payload.display().to_string(),
+            temp_payload.display().to_string(),
             manifest_json,
             manifest.payload_checksum,
         ],
     )
-    .map_err(|error| ConfigError::Io {
-        path: snapshot_dir.to_path_buf(),
-        message: error.to_string(),
+    .map_err(|error| {
+        let _ = fs::remove_file(&temp_payload);
+        ConfigError::Io {
+            path: snapshot_dir.to_path_buf(),
+            message: error.to_string(),
+        }
     })?;
     for (snap_root, local_root) in maps {
-        tx.execute(
+        if let Err(error) = tx.execute(
             "INSERT INTO snapshot_root_maps(snapshot_id, snapshot_root_id, local_root_id)
              VALUES (?1,?2,?3)",
             params![snapshot_id, snap_root, local_root],
-        )
-        .map_err(|error| ConfigError::Io {
+        ) {
+            let _ = fs::remove_file(&temp_payload);
+            return Err(ConfigError::Io {
+                path: snapshot_dir.to_path_buf(),
+                message: error.to_string(),
+            });
+        }
+    }
+    if let Err(error) = tx.commit() {
+        let _ = fs::remove_file(&temp_payload);
+        return Err(ConfigError::Io {
             path: snapshot_dir.to_path_buf(),
             message: error.to_string(),
-        })?;
+        });
     }
-    tx.commit().map_err(|error| ConfigError::Io {
-        path: snapshot_dir.to_path_buf(),
-        message: error.to_string(),
-    })?;
+    if let Err(error) = fs::rename(&temp_payload, &stored_payload) {
+        // Compensation: registration succeeded but final name failed — remove registration.
+        let _ = connection.execute(
+            "DELETE FROM snapshot_root_maps WHERE snapshot_id = ?1",
+            params![snapshot_id],
+        );
+        let _ = connection.execute("DELETE FROM snapshots WHERE id = ?1", params![snapshot_id]);
+        let _ = fs::remove_file(&temp_payload);
+        return Err(ConfigError::Io {
+            path: stored_payload,
+            message: error.to_string(),
+        });
+    }
+    // Update path to final name
+    let _ = connection.execute(
+        "UPDATE snapshots SET payload_path = ?1 WHERE id = ?2",
+        params![stored_payload.display().to_string(), snapshot_id],
+    );
     let _ = data_dir;
     let _ = store_dir;
     Ok(SnapshotImportReport {
@@ -308,7 +368,11 @@ pub fn import_snapshot(
 }
 
 fn validate_snapshot_tree(path: &Path) -> Result<(), ConfigError> {
-    if !path.is_dir() {
+    let root_meta = fs::symlink_metadata(path).map_err(|error| ConfigError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return Err(ConfigError::NotDirectory(path.to_path_buf()));
     }
     let mut entries = 0_u32;
@@ -329,29 +393,38 @@ fn validate_snapshot_tree(path: &Path) -> Result<(), ConfigError> {
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if matches!(name.as_ref(), "MANIFEST.json" | "payload.sqlite3") {
-            let meta = entry.metadata().map_err(|error| ConfigError::Io {
-                path: entry.path(),
-                message: error.to_string(),
-            })?;
-            if meta.file_type().is_symlink() || !meta.is_file() {
-                return Err(ConfigError::Invalid {
-                    path: entry.path(),
-                    message: "snapshot entry must be a regular file".into(),
-                });
-            }
-            if meta.len() > MAX_SNAPSHOT_BYTES {
-                return Err(ConfigError::Invalid {
-                    path: entry.path(),
-                    message: "snapshot entry exceeds size limit".into(),
-                });
-            }
-            continue;
-        }
-        return Err(ConfigError::Invalid {
+        let file_type = entry.file_type().map_err(|error| ConfigError::Io {
             path: entry.path(),
-            message: format!("unexpected snapshot entry {name}"),
-        });
+            message: error.to_string(),
+        })?;
+        if file_type.is_symlink() {
+            return Err(ConfigError::Invalid {
+                path: entry.path(),
+                message: "snapshot must not contain symlinks".into(),
+            });
+        }
+        if !matches!(name.as_ref(), "MANIFEST.json" | "payload.sqlite3") {
+            return Err(ConfigError::Invalid {
+                path: entry.path(),
+                message: format!("unexpected snapshot entry {name}"),
+            });
+        }
+        if !file_type.is_file() {
+            return Err(ConfigError::Invalid {
+                path: entry.path(),
+                message: "snapshot entry must be a regular file".into(),
+            });
+        }
+        let meta = fs::symlink_metadata(entry.path()).map_err(|error| ConfigError::Io {
+            path: entry.path(),
+            message: error.to_string(),
+        })?;
+        if meta.len() > MAX_SNAPSHOT_BYTES {
+            return Err(ConfigError::Invalid {
+                path: entry.path(),
+                message: "snapshot entry exceeds size limit".into(),
+            });
+        }
     }
     if !path.join("MANIFEST.json").is_file() || !path.join("payload.sqlite3").is_file() {
         return Err(ConfigError::Invalid {
@@ -622,6 +695,622 @@ pub fn parse_root_maps(values: &[String]) -> Result<Vec<(String, String)>, Confi
         out.push((left.to_owned(), right.to_owned()));
     }
     Ok(out)
+}
+
+/// Eligible mapped snapshot source for federated retrieval.
+#[derive(Debug, Clone)]
+pub struct SnapshotSource {
+    pub snapshot_id: String,
+    pub snapshot_root_id: String,
+    pub local_root_id: crate::domain::RootId,
+    pub payload_path: PathBuf,
+}
+
+/// Opens a managed snapshot payload read-only.
+///
+/// # Errors
+///
+/// Returns configuration errors when the file cannot be opened read-only.
+pub fn open_snapshot_readonly(path: &Path) -> Result<Connection, ConfigError> {
+    let uri = format!("file:{}?mode=ro", path.display());
+    Connection::open_with_flags(
+        &uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|error| ConfigError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })
+}
+
+/// Lists fully mapped, healthy snapshot sources eligible for a query.
+///
+/// # Errors
+///
+/// Returns storage/config failures when registry rows cannot be read.
+pub fn eligible_snapshot_sources(
+    connection: &Connection,
+    config: &crate::config::AppConfig,
+    request: &crate::domain::RetrievalQuery,
+) -> Result<Vec<SnapshotSource>, ConfigError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT s.id, s.payload_path, m.snapshot_root_id, m.local_root_id
+             FROM snapshots s
+             INNER JOIN snapshot_root_maps m ON m.snapshot_id = s.id
+             ORDER BY s.imported_at_ms ASC, s.id ASC, m.snapshot_root_id ASC",
+        )
+        .map_err(|error| ConfigError::Io {
+            path: PathBuf::from("db"),
+            message: error.to_string(),
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| ConfigError::Io {
+            path: PathBuf::from("db"),
+            message: error.to_string(),
+        })?;
+    let enabled: std::collections::HashSet<String> = config
+        .roots
+        .iter()
+        .filter(|root| root.enabled)
+        .map(|root| root.id.clone())
+        .collect();
+    let mut out = Vec::new();
+    for row in rows {
+        let (snapshot_id, payload_path, snap_root, local_root) =
+            row.map_err(|error| ConfigError::Io {
+                path: PathBuf::from("db"),
+                message: error.to_string(),
+            })?;
+        if !enabled.contains(&local_root) {
+            continue;
+        }
+        let local_id = local_root
+            .parse::<crate::domain::RootId>()
+            .map_err(|_| ConfigError::RootNotFound(local_root.clone()))?;
+        if !request.root_ids.is_empty() && !request.root_ids.contains(&local_id) {
+            continue;
+        }
+        let path = PathBuf::from(&payload_path);
+        if !path.is_file() {
+            continue;
+        }
+        // Ensure path is under managed snapshots dir when possible.
+        out.push(SnapshotSource {
+            snapshot_id,
+            snapshot_root_id: snap_root,
+            local_root_id: local_id,
+            payload_path: path,
+        });
+    }
+    Ok(out)
+}
+
+/// Sanitized snapshot listing row.
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotListItem {
+    pub snapshot_id: String,
+    pub logical_name: String,
+    pub imported_at_ms: i64,
+    pub format_version: i64,
+    pub checksum: String,
+    pub payload_healthy: bool,
+    pub total_roots: usize,
+    pub mapped_roots: usize,
+    pub segment_count: i64,
+    pub queryable: bool,
+}
+
+/// Lists registered snapshots without exposing managed absolute paths.
+///
+/// # Errors
+///
+/// Returns database errors.
+pub fn list_snapshots(connection: &Connection) -> Result<Vec<SnapshotListItem>, ConfigError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, logical_name, imported_at_ms, format_version, checksum, payload_path, manifest_json
+             FROM snapshots ORDER BY imported_at_ms ASC, id ASC",
+        )
+        .map_err(|e| ConfigError::Io {
+            path: PathBuf::from("db"),
+            message: e.to_string(),
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(|e| ConfigError::Io {
+            path: PathBuf::from("db"),
+            message: e.to_string(),
+        })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, name, imported, version, checksum, payload, manifest_json) =
+            row.map_err(|e| ConfigError::Io {
+                path: PathBuf::from("db"),
+                message: e.to_string(),
+            })?;
+        let manifest: SnapshotManifest =
+            serde_json::from_str(&manifest_json).unwrap_or(SnapshotManifest {
+                snapshot_format_version: 0,
+                omnisem_version: String::new(),
+                schema_compatibility: SchemaCompatibility { min: 0, max: 0 },
+                created_at_ms: 0,
+                payload_checksum: checksum.clone(),
+                roots: Vec::new(),
+                counts: SnapshotCounts {
+                    sources: 0,
+                    revisions: 0,
+                    segments: 0,
+                    fts_rows: 0,
+                },
+                embedding_spaces: Vec::new(),
+                capabilities: Vec::new(),
+                warning: String::new(),
+            });
+        let mapped: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM snapshot_root_maps WHERE snapshot_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let healthy = Path::new(&payload).is_file();
+        let total_roots = manifest.roots.len();
+        let mapped_n = usize::try_from(mapped).unwrap_or(0);
+        let queryable = healthy && mapped_n == total_roots && total_roots > 0;
+        out.push(SnapshotListItem {
+            snapshot_id: id,
+            logical_name: name,
+            imported_at_ms: imported,
+            format_version: version,
+            checksum,
+            payload_healthy: healthy,
+            total_roots,
+            mapped_roots: usize::try_from(mapped).unwrap_or(0),
+            segment_count: manifest.counts.segments,
+            queryable,
+        });
+    }
+    Ok(out)
+}
+
+/// Sanitized inspect view.
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotInspect {
+    pub snapshot_id: String,
+    pub logical_name: String,
+    pub format_version: i64,
+    pub checksum: String,
+    pub payload_healthy: bool,
+    pub queryable: bool,
+    pub roots: Vec<SnapshotRootDescriptor>,
+    pub mappings: Vec<String>,
+    pub counts: SnapshotCounts,
+    pub warning: String,
+}
+
+/// Inspects one snapshot without exposing managed filesystem paths.
+///
+/// # Errors
+///
+/// Returns not-found or database errors.
+pub fn inspect_snapshot(
+    connection: &Connection,
+    snapshot_id: &str,
+) -> Result<SnapshotInspect, ConfigError> {
+    let row = connection
+        .query_row(
+            "SELECT logical_name, format_version, checksum, payload_path, manifest_json
+             FROM snapshots WHERE id = ?1",
+            params![snapshot_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .map_err(|_| ConfigError::Invalid {
+            path: PathBuf::from("snapshot"),
+            message: format!("snapshot not found: {snapshot_id}"),
+        })?;
+    let (name, version, checksum, payload, manifest_json) = row;
+    let manifest: SnapshotManifest =
+        serde_json::from_str(&manifest_json).map_err(|e| ConfigError::Invalid {
+            path: PathBuf::from("snapshot"),
+            message: e.to_string(),
+        })?;
+    let mut map_stmt = connection
+        .prepare(
+            "SELECT snapshot_root_id || '=' || local_root_id FROM snapshot_root_maps
+             WHERE snapshot_id = ?1 ORDER BY snapshot_root_id",
+        )
+        .map_err(|e| ConfigError::Io {
+            path: PathBuf::from("db"),
+            message: e.to_string(),
+        })?;
+    let mappings = map_stmt
+        .query_map(params![snapshot_id], |r| r.get::<_, String>(0))
+        .map_err(|e| ConfigError::Io {
+            path: PathBuf::from("db"),
+            message: e.to_string(),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ConfigError::Io {
+            path: PathBuf::from("db"),
+            message: e.to_string(),
+        })?;
+    let healthy = Path::new(&payload).is_file();
+    let queryable = healthy && mappings.len() == manifest.roots.len() && !manifest.roots.is_empty();
+    Ok(SnapshotInspect {
+        snapshot_id: snapshot_id.into(),
+        logical_name: name,
+        format_version: version,
+        checksum,
+        payload_healthy: healthy,
+        queryable,
+        roots: manifest.roots,
+        mappings,
+        counts: manifest.counts,
+        warning: manifest.warning,
+    })
+}
+
+/// Removes a registered snapshot and its managed payload when safe.
+///
+/// # Errors
+///
+/// Returns not-found or IO errors.
+pub fn remove_snapshot(
+    connection: &mut Connection,
+    snapshot_id: &str,
+) -> Result<SnapshotImportReport, ConfigError> {
+    let (payload_path, segments): (String, i64) = connection
+        .query_row(
+            "SELECT payload_path, json_extract(manifest_json, '$.counts.segments')
+             FROM snapshots WHERE id = ?1",
+            params![snapshot_id],
+            |row| Ok((row.get(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+        )
+        .map_err(|_| ConfigError::Invalid {
+            path: PathBuf::from("snapshot"),
+            message: format!("snapshot not found: {snapshot_id}"),
+        })?;
+    let maps: Vec<String> = connection
+        .prepare(
+            "SELECT snapshot_root_id || '->' || local_root_id FROM snapshot_root_maps WHERE snapshot_id = ?1",
+        )
+        .map_err(|e| ConfigError::Io {
+            path: PathBuf::from("db"),
+            message: e.to_string(),
+        })?
+        .query_map(params![snapshot_id], |r| r.get(0))
+        .map_err(|e| ConfigError::Io {
+            path: PathBuf::from("db"),
+            message: e.to_string(),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ConfigError::Io {
+            path: PathBuf::from("db"),
+            message: e.to_string(),
+        })?;
+
+    let main_path: String = connection
+        .query_row("PRAGMA database_list", [], |row| row.get::<_, String>(2))
+        .unwrap_or_default();
+    let managed_dir = Path::new(&main_path)
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        .join("snapshots");
+    let payload = PathBuf::from(&payload_path);
+    if !payload.starts_with(&managed_dir) {
+        return Err(ConfigError::Invalid {
+            path: payload,
+            message: "refusing to delete payload outside managed snapshot directory".into(),
+        });
+    }
+
+    let tx = connection.transaction().map_err(|e| ConfigError::Io {
+        path: PathBuf::from("db"),
+        message: e.to_string(),
+    })?;
+    tx.execute(
+        "DELETE FROM snapshot_root_maps WHERE snapshot_id = ?1",
+        params![snapshot_id],
+    )
+    .map_err(|e| ConfigError::Io {
+        path: PathBuf::from("db"),
+        message: e.to_string(),
+    })?;
+    tx.execute("DELETE FROM snapshots WHERE id = ?1", params![snapshot_id])
+        .map_err(|e| ConfigError::Io {
+            path: PathBuf::from("db"),
+            message: e.to_string(),
+        })?;
+    tx.commit().map_err(|e| ConfigError::Io {
+        path: PathBuf::from("db"),
+        message: e.to_string(),
+    })?;
+    if payload.exists() {
+        fs::remove_file(&payload).map_err(|e| ConfigError::Io {
+            path: payload,
+            message: format!("registration removed but payload cleanup failed: {e}"),
+        })?;
+    }
+    Ok(SnapshotImportReport {
+        snapshot_id: snapshot_id.into(),
+        mapped_roots: maps,
+        segments,
+    })
+}
+
+/// Validates manifest compatibility declarations before registration.
+fn validate_manifest_compatibility(
+    manifest: &SnapshotManifest,
+    snapshot_dir: &Path,
+) -> Result<(), ConfigError> {
+    if manifest.snapshot_format_version != SNAPSHOT_FORMAT_VERSION {
+        return Err(ConfigError::Invalid {
+            path: snapshot_dir.to_path_buf(),
+            message: format!(
+                "unsupported snapshot format {}",
+                manifest.snapshot_format_version
+            ),
+        });
+    }
+    if manifest.schema_compatibility.min < 0
+        || manifest.schema_compatibility.max < 0
+        || manifest.schema_compatibility.min > manifest.schema_compatibility.max
+    {
+        return Err(ConfigError::Invalid {
+            path: snapshot_dir.to_path_buf(),
+            message: "contradictory schema compatibility range".into(),
+        });
+    }
+    // This installation currently supports schema versions through 3.
+    if manifest.schema_compatibility.min > 3 || manifest.schema_compatibility.max < 2 {
+        return Err(ConfigError::Invalid {
+            path: snapshot_dir.to_path_buf(),
+            message: "snapshot schema range is not supported by this installation".into(),
+        });
+    }
+    if !manifest.embedding_spaces.is_empty() {
+        return Err(ConfigError::Invalid {
+            path: snapshot_dir.to_path_buf(),
+            message: "snapshot declares unknown embedding spaces".into(),
+        });
+    }
+    for capability in &manifest.capabilities {
+        if !matches!(
+            capability.as_str(),
+            "lexical_fts5" | "read_only_retrieval" | "markdown" | "plain_text"
+        ) {
+            return Err(ConfigError::Invalid {
+                path: snapshot_dir.to_path_buf(),
+                message: format!("unsupported snapshot capability: {capability}"),
+            });
+        }
+    }
+    let mut seen_roots = std::collections::HashSet::new();
+    for root in &manifest.roots {
+        if root.snapshot_root_id.is_empty() {
+            return Err(ConfigError::Invalid {
+                path: snapshot_dir.to_path_buf(),
+                message: "snapshot root id must be nonempty".into(),
+            });
+        }
+        if !seen_roots.insert(root.snapshot_root_id.clone()) {
+            return Err(ConfigError::Invalid {
+                path: snapshot_dir.to_path_buf(),
+                message: format!("duplicate snapshot root id {}", root.snapshot_root_id),
+            });
+        }
+        if root.source_count < 0 || root.segment_count < 0 {
+            return Err(ConfigError::Invalid {
+                path: snapshot_dir.to_path_buf(),
+                message: "root counts must be nonnegative".into(),
+            });
+        }
+    }
+    let counts = &manifest.counts;
+    if counts.sources < 0
+        || counts.revisions < 0
+        || counts.segments < 0
+        || counts.fts_rows < 0
+        || counts.segments > 1_000_000
+        || counts.fts_rows > 1_000_000
+    {
+        return Err(ConfigError::Invalid {
+            path: snapshot_dir.to_path_buf(),
+            message: "manifest counts out of supported range".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Validates payload integrity and relationship invariants.
+#[allow(clippy::too_many_lines)]
+fn validate_payload_database(path: &Path, manifest: &SnapshotManifest) -> Result<(), ConfigError> {
+    let connection = open_snapshot_readonly(path)?;
+    let ok: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .unwrap_or_else(|_| "failed".into());
+    if ok != "ok" {
+        return Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            message: "payload integrity_check failed".into(),
+        });
+    }
+    let _ = connection.execute_batch("PRAGMA foreign_keys = ON;");
+    for table in [
+        "roots",
+        "source_files",
+        "revisions",
+        "segments",
+        "segments_fts",
+    ] {
+        let exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type IN ('table','view') AND name = ?1",
+                params![table],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if exists == 0 {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message: format!("payload missing required table {table}"),
+            });
+        }
+    }
+    let segments: i64 = connection
+        .query_row("SELECT COUNT(*) FROM segments", [], |r| r.get(0))
+        .unwrap_or(-1);
+    let fts: i64 = connection
+        .query_row("SELECT COUNT(*) FROM segments_fts", [], |r| r.get(0))
+        .unwrap_or(-1);
+    let sources: i64 = connection
+        .query_row("SELECT COUNT(*) FROM source_files", [], |r| r.get(0))
+        .unwrap_or(-1);
+    let revisions: i64 = connection
+        .query_row("SELECT COUNT(*) FROM revisions", [], |r| r.get(0))
+        .unwrap_or(-1);
+    if segments != manifest.counts.segments
+        || fts != manifest.counts.fts_rows
+        || sources != manifest.counts.sources
+        || revisions != manifest.counts.revisions
+    {
+        return Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            message: "manifest counts do not match payload".into(),
+        });
+    }
+    // Active sources must point at present revisions.
+    let broken_sources: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM source_files sf
+             WHERE sf.state = 'active'
+               AND (sf.current_revision_id IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM revisions r WHERE r.id = sf.current_revision_id))",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(1);
+    if broken_sources > 0 {
+        return Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            message: "payload has active sources without valid revisions".into(),
+        });
+    }
+    // Segments must belong to a known revision.
+    let orphan_segments: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM segments s
+             WHERE NOT EXISTS (SELECT 1 FROM revisions r WHERE r.id = s.revision_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(1);
+    if orphan_segments > 0 {
+        return Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            message: "payload has segments without revisions".into(),
+        });
+    }
+    // FTS rows must correspond to real segments.
+    let orphan_fts: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM segments_fts f
+             WHERE NOT EXISTS (SELECT 1 FROM segments s WHERE s.id = f.segment_id)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(1);
+    if orphan_fts > 0 {
+        return Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            message: "payload FTS rows do not match segments".into(),
+        });
+    }
+    // Relative path safety and declared roots only.
+    let declared: std::collections::HashSet<String> = manifest
+        .roots
+        .iter()
+        .map(|root| root.snapshot_root_id.clone())
+        .collect();
+    let mut stmt = connection
+        .prepare("SELECT root_id, relative_path, file_type FROM source_files")
+        .map_err(|e| ConfigError::Io {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| ConfigError::Io {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+    for row in rows {
+        let (root_id, relative, file_type) = row.map_err(|e| ConfigError::Io {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+        if !declared.contains(&root_id) {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message: format!("payload root id undeclared in manifest: {root_id}"),
+            });
+        }
+        let p = PathBuf::from(&relative);
+        if p.is_absolute()
+            || p.as_os_str().is_empty()
+            || p.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::RootDir
+                )
+            })
+        {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message: format!("unsafe relative path in payload: {relative}"),
+            });
+        }
+        if !matches!(file_type.as_str(), "markdown" | "plain_text") {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                message: format!("unknown file type in payload: {file_type}"),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

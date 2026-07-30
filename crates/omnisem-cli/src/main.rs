@@ -13,7 +13,10 @@ use omnisem_core::eval::run_evaluation;
 use omnisem_core::index::{IndexOptions, IndexReport, index_roots_with_options};
 use omnisem_core::paths::AppPaths;
 use omnisem_core::retrieval::{resolve_budget_args, retrieve};
-use omnisem_core::snapshot::{export_snapshot, import_snapshot, parse_root_maps};
+use omnisem_core::snapshot::{
+    export_snapshot, import_snapshot, inspect_snapshot, list_snapshots, parse_root_maps,
+    remove_snapshot,
+};
 use omnisem_core::status_server::serve_status;
 use omnisem_core::storage::record_query_activity;
 use omnisem_core::storage::{
@@ -132,6 +135,23 @@ enum SnapshotCommand {
         /// Mapping `SNAPSHOT_ROOT_ID=LOCAL_ROOT_ID` (repeatable).
         #[arg(long = "map")]
         map: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List registered snapshots.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one registered snapshot.
+    Inspect {
+        snapshot_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a registered snapshot and its managed payload.
+    Remove {
+        snapshot_id: String,
         #[arg(long)]
         json: bool,
     },
@@ -708,14 +728,21 @@ fn cmd_query(
         );
     } else {
         for (index, hit) in response.results.iter().enumerate() {
+            let origin = match &hit.origin {
+                omnisem_core::domain::EvidenceOrigin::LocalIndex => "local".to_owned(),
+                omnisem_core::domain::EvidenceOrigin::Snapshot { snapshot_id, .. } => {
+                    format!("snapshot:{snapshot_id}")
+                }
+            };
             println!(
-                "{}. {}#{}  score={:.4}  freshness={}  tokens={}",
+                "{}. {}#{}  score={:.4}  freshness={}  tokens={}  origin={}",
                 index + 1,
                 hit.relative_path.display(),
                 hit.anchor,
                 hit.score,
                 hit.freshness.as_str(),
-                hit.token_estimate
+                hit.token_estimate,
+                origin
             );
             println!("   revision={}", hit.revision_id);
             if let Some(scope) = hit.sensitivity_scope {
@@ -792,6 +819,7 @@ fn cmd_eval(corpus: Option<&Path>, mode: &str, json: bool) -> Result<ExitCode, E
     Ok(ExitCode::Success)
 }
 
+#[allow(clippy::too_many_lines)]
 fn cmd_snapshot(paths: &AppPaths, action: SnapshotCommand) -> Result<ExitCode, ExitCode> {
     let config = load_or_init(paths).map_err(|error| print_config_err(&error))?;
     let database_path = config
@@ -841,6 +869,68 @@ fn cmd_snapshot(paths: &AppPaths, action: SnapshotCommand) -> Result<ExitCode, E
             } else {
                 println!("imported snapshot {}", report.snapshot_id);
                 println!("maps: {}", report.mapped_roots.join(", "));
+            }
+            Ok(ExitCode::Success)
+        }
+        SnapshotCommand::List { json } => {
+            let connection = open_database(&database_path).map_err(|error| {
+                eprintln!("error: {error}");
+                ExitCode::Database
+            })?;
+            let items = list_snapshots(&connection).map_err(|error| print_config_err(&error))?;
+            if json {
+                print_json(&items).map_err(|error| print_config_err(&error))?;
+            } else if items.is_empty() {
+                println!("No snapshots registered.");
+            } else {
+                for item in items {
+                    println!(
+                        "{}  {}  queryable={} healthy={} segments={} maps={}/{}",
+                        item.snapshot_id,
+                        item.logical_name,
+                        item.queryable,
+                        item.payload_healthy,
+                        item.segment_count,
+                        item.mapped_roots,
+                        item.total_roots
+                    );
+                }
+            }
+            Ok(ExitCode::Success)
+        }
+        SnapshotCommand::Inspect { snapshot_id, json } => {
+            let connection = open_database(&database_path).map_err(|error| {
+                eprintln!("error: {error}");
+                ExitCode::Database
+            })?;
+            let item = inspect_snapshot(&connection, &snapshot_id)
+                .map_err(|error| print_config_err(&error))?;
+            if json {
+                print_json(&item).map_err(|error| print_config_err(&error))?;
+            } else {
+                println!("snapshot {}", item.snapshot_id);
+                println!(
+                    "queryable={} healthy={}",
+                    item.queryable, item.payload_healthy
+                );
+                println!("segments={}", item.counts.segments);
+                println!("mappings: {}", item.mappings.join(", "));
+                println!("{}", item.warning);
+            }
+            Ok(ExitCode::Success)
+        }
+        SnapshotCommand::Remove { snapshot_id, json } => {
+            let mut connection = open_database(&database_path).map_err(|error| {
+                eprintln!("error: {error}");
+                ExitCode::Database
+            })?;
+            let report = remove_snapshot(&mut connection, &snapshot_id)
+                .map_err(|error| print_config_err(&error))?;
+            if json {
+                print_json(&report).map_err(|error| print_config_err(&error))?;
+            } else {
+                println!("removed snapshot {}", report.snapshot_id);
+                println!("segments_were={}", report.segments);
             }
             Ok(ExitCode::Success)
         }
