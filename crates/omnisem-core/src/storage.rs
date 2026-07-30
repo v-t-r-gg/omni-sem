@@ -14,10 +14,11 @@ use crate::hash::blake3_hex;
 use crate::paths::restrict_permissions;
 
 /// Current schema version understood by this executable.
-pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 const MIGRATION_1: &str = include_str!("../../../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../../../migrations/0002_operational_indexing.sql");
+const MIGRATION_3: &str = include_str!("../../../migrations/0003_m3_incremental_snapshots.sql");
 
 /// Applies every pending migration transactionally.
 ///
@@ -42,7 +43,144 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
         apply(transaction, 2, MIGRATION_2)?;
         verify_fts5(connection)?;
     }
+    if schema_version(connection)?.unwrap_or(0) < 3 {
+        apply(connection.transaction()?, 3, MIGRATION_3)?;
+    }
     Ok(())
+}
+
+/// Persisted Git base for incremental indexing of one root.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RootGitState {
+    pub root_id: String,
+    pub repo_fingerprint: Option<String>,
+    pub last_indexed_commit: Option<String>,
+    pub observed_head: Option<String>,
+    pub last_incremental_base: Option<String>,
+    pub last_incremental_at_ms: Option<i64>,
+}
+
+/// Loads Git state for a root when present.
+///
+/// # Errors
+///
+/// Returns database errors.
+pub fn load_root_git_state(
+    connection: &Connection,
+    root_id: &RootId,
+) -> Result<Option<RootGitState>, StorageError> {
+    connection
+        .query_row(
+            "SELECT root_id, repo_fingerprint, last_indexed_commit, observed_head,
+                    last_incremental_base, last_incremental_at_ms
+             FROM root_git_state WHERE root_id = ?1",
+            [root_id.to_string()],
+            |row| {
+                Ok(RootGitState {
+                    root_id: row.get(0)?,
+                    repo_fingerprint: row.get(1)?,
+                    last_indexed_commit: row.get(2)?,
+                    observed_head: row.get(3)?,
+                    last_incremental_base: row.get(4)?,
+                    last_incremental_at_ms: row.get(5)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StorageError::from)
+}
+
+/// Upserts Git state for a root.
+///
+/// # Errors
+///
+/// Returns database errors.
+pub fn upsert_root_git_state(
+    connection: &Connection,
+    state: &RootGitState,
+) -> Result<(), StorageError> {
+    connection.execute(
+        "INSERT INTO root_git_state(
+            root_id, repo_fingerprint, last_indexed_commit, observed_head,
+            last_incremental_base, last_incremental_at_ms
+        ) VALUES (?1,?2,?3,?4,?5,?6)
+        ON CONFLICT(root_id) DO UPDATE SET
+            repo_fingerprint=excluded.repo_fingerprint,
+            last_indexed_commit=excluded.last_indexed_commit,
+            observed_head=excluded.observed_head,
+            last_incremental_base=excluded.last_incremental_base,
+            last_incremental_at_ms=excluded.last_incremental_at_ms",
+        params![
+            state.root_id,
+            state.repo_fingerprint,
+            state.last_indexed_commit,
+            state.observed_head,
+            state.last_incremental_base,
+            state.last_incremental_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Records a query activity sample without storing query text.
+///
+/// # Errors
+///
+/// Returns database errors.
+pub fn record_query_activity(
+    connection: &Connection,
+    observed_at_ms: i64,
+    mode: &str,
+    result_count: i64,
+    elapsed_ms: i64,
+) -> Result<(), StorageError> {
+    connection.execute(
+        "INSERT INTO query_activity(observed_at_ms, mode, result_count, elapsed_ms)
+         VALUES (?1,?2,?3,?4)",
+        params![observed_at_ms, mode, result_count, elapsed_ms],
+    )?;
+    // Retain a bounded window.
+    connection.execute(
+        "DELETE FROM query_activity WHERE id NOT IN (
+            SELECT id FROM query_activity ORDER BY observed_at_ms DESC LIMIT 100
+         )",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Recent query activity samples for status display.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct QueryActivitySample {
+    pub observed_at_ms: i64,
+    pub mode: String,
+    pub result_count: i64,
+    pub elapsed_ms: i64,
+}
+
+/// Lists recent query activity.
+///
+/// # Errors
+///
+/// Returns database errors.
+pub fn list_query_activity(
+    connection: &Connection,
+    limit: i64,
+) -> Result<Vec<QueryActivitySample>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT observed_at_ms, mode, result_count, elapsed_ms
+         FROM query_activity ORDER BY observed_at_ms DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        Ok(QueryActivitySample {
+            observed_at_ms: row.get(0)?,
+            mode: row.get(1)?,
+            result_count: row.get(2)?,
+            elapsed_ms: row.get(3)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
 }
 
 fn schema_version(connection: &Connection) -> Result<Option<i64>, StorageError> {
@@ -826,7 +964,7 @@ mod tests {
         let version: i64 = connection
             .query_row("SELECT version FROM schema_metadata", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
     }
 
     #[test]

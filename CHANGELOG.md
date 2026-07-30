@@ -6,12 +6,14 @@ All notable changes will be documented here. The format follows Keep a Changelog
 
 ### Added
 
-- Milestone 2 lexical retrieval: safe query parsing, FTS5 BM25 ranking, match explanations, freshness status, sensitivity-aware CLI filtering, duplicate suppression, token budgeting, and context packing.
-- Named budget presets (`small`, `standard`, `large`) in configuration.
-- `omnisem query` with `--mode`, `--root`, `--file-type`, `--limit`, `--token-budget`, `--budget`, `--include-sensitive`, `--explain`, and `--json`.
-- `omnisem eval` isolated evaluation runner with Recall@k, MRR, nDCG, diversity, duplicate/stale/misleading rates, and p50/p95 latency.
-- Retrieval domain contract extensions and documentation.
+- Milestone 3: Git-aware `omnisem index --since`, snapshot export/import, and loopback `omnisem status --serve`.
+- Schema v3 tables for Git base state, snapshot registry, and query-activity samples (no query text).
+- ADR-0015 snapshot format v1.
+
+### Fixed (Milestone 2)
+
+- Public BM25 score mapping (`-raw`), freshness-based stale-result rate, content-stable index fingerprints.
 
 ### Previously
 
-- Milestone 1 operational indexing CLI, schema v2, FTS5 active surface, discovery, and parsers.
+- Milestone 1 operational indexing and Milestone 2 lexical retrieval/evaluation.

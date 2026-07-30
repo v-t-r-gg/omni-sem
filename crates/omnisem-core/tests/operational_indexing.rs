@@ -30,7 +30,7 @@ fn init_root_index_status_changes_and_remove() {
     assert_eq!(report.failures, 0);
 
     let status = status_snapshot(&connection, &db_path).unwrap();
-    assert_eq!(status.schema_version, 2);
+    assert_eq!(status.schema_version, 3);
     assert_eq!(status.active_source_files, 1);
     assert!(status.fts_rows >= 1);
     assert_eq!(status.fts_rows, status.active_segments);

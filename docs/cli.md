@@ -76,3 +76,24 @@ Public lexical scores are higher-is-better (`public = -raw_bm25`). Raw FTS5 BM25
 ### `omnisem eval [--corpus PATH] [--mode lexical] [--json]`
 
 Runs the production indexer and retriever against an evaluation bundle in an isolated temporary data root. Default bundle is the repository `evals/` directory when present.
+
+### `omnisem index --since [REVISION]`
+
+Git-aware incremental indexing when the root is inside a Git work tree.
+
+- `--since` alone uses the last successfully recorded Git base, or full-scans when none exists.
+- `--since REVISION` compares against that revision.
+- Non-Git roots or Git failures fall back to full discovery with a reported reason.
+- Incremental mode deletes only paths Git reports as deleted/renamed-away.
+
+### `omnisem snapshot export PATH`
+
+Writes a directory snapshot (`MANIFEST.json` + `payload.sqlite3`). Contains derived indexed text; treat as sensitive. Refuses overwrite.
+
+### `omnisem snapshot import PATH --map SNAP=LOCAL`
+
+Validates checksum/format, stores payload, and registers visibility only for explicit root maps.
+
+### `omnisem status --serve [--port N]`
+
+Loopback-only read-only HTTP status (`127.0.0.1`). Port `0` selects ephemeral. Serves `/`, `/health`, `/api/status`, `/api/roots`, `/api/activity` without source or query text.
