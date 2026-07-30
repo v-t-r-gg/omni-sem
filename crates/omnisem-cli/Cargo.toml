@@ -14,7 +14,13 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 omnisem-core = { path = "../omnisem-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+omnisem-core = { path = "../omnisem-core" }
 
 [lints]
 workspace = true
-

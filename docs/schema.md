@@ -1,16 +1,44 @@
-# SQLite schema proposal
+# SQLite schema
 
-Schema version 1 establishes `schema_metadata`, `roots`, `source_files`, `revisions`, and `segments`. Identifiers are opaque UUID text. Domain timestamps now use milliseconds since the Unix epoch (`Timestamp`); corresponding SQL columns and sensitivity-tag storage are planned for the next schema-alignment slice and are not present in migration `0001_initial.sql` yet. Include/exclude lists and segment metadata are JSON text to preserve a narrow schema while remaining inspectable.
+## Versions
 
-Key invariants:
+| Version | Migration | Notes |
+|---:|---|---|
+| 1 | `0001_initial.sql` | foundation tables |
+| 2 | `0002_operational_indexing.sql` | timestamps, sensitivity, scan runs, FTS5 |
 
-- one source identity per root-relative path;
-- revision uniqueness includes source, content hash, parser ID, and parser version;
-- segment anchors and ordinals are unique inside a revision;
-- current revision promotion will be an explicit transaction in a later Milestone 1 slice;
-- foreign keys are enabled by the connection boundary;
-- future schema versions are rejected.
+Current executable schema version: **2**.
 
-FTS is intentionally not created yet. A later Milestone 1 slice must verify FTS5 availability and specify how active-revision filtering and transactional replacement work before adding its migration.
+Migration `0001` is never rewritten. `0002` uses `ALTER TABLE` and creates `scan_runs` plus `segments_fts`. Future schema versions are rejected.
 
-The project-owned migration runner applies monotonic SQL migrations inside transactions. A failed migration is returned as a database error and is not marked complete. Downgrades are unsupported; rebuildable derived databases may be reconstructed when documented migrations cannot apply.
+Failed migrations are not marked complete. Foreign keys are enabled at the connection boundary.
+
+## Tables
+
+### `roots`
+
+Opaque ID, canonical path, display name, include/exclude JSON, sensitivity JSON, symlink flag, enabled flag, created/updated timestamps, configuration fingerprint.
+
+### `source_files`
+
+Root-relative identity, path hash, file type, size, source mtime, current revision pointer, state, first/last seen timestamps.
+
+### `revisions`
+
+Immutable content projection: content hash, parser identity/version, extracted-text hash, observed/indexed timestamps, status, safe error code/message.
+
+### `segments`
+
+Ordered evidence for one revision: type, anchor, ordinal, text, text hash, optional token count, metadata JSON, optional sensitivity scope.
+
+### `scan_runs`
+
+Per-root scan counters and completion status for operational reporting. Not a general job system.
+
+### `segments_fts`
+
+FTS5 virtual table with segment text and unindexed identity columns. Maintained explicitly so only active revisions are searchable.
+
+## Compatibility
+
+Upgrade path: empty DB or v1 DB → migrate to v2. Downgrades are unsupported. Derived databases may be rebuilt when needed.
