@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::default_exclude_patterns;
-use crate::domain::{Root, RootId, SensitivityScope, SensitivityTag, Timestamp};
+use crate::domain::{BudgetPreset, Root, RootId, SensitivityScope, SensitivityTag, Timestamp};
 use crate::error::ConfigError;
 use crate::hash::blake3_hex;
 use crate::paths::{AppPaths, expand_user_path, restrict_permissions};
@@ -17,7 +17,68 @@ use crate::paths::{AppPaths, expand_user_path, restrict_permissions};
 pub struct AppConfig {
     pub general: GeneralConfig,
     #[serde(default)]
+    pub retrieval: RetrievalConfig,
+    #[serde(default)]
     pub roots: Vec<RootConfig>,
+}
+
+/// Retrieval defaults and named budget presets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetrievalConfig {
+    #[serde(default = "default_limit")]
+    pub default_limit: u16,
+    #[serde(default = "default_token_budget")]
+    pub default_token_budget: u32,
+    #[serde(default = "default_budget_presets")]
+    pub budgets: Vec<BudgetPresetConfig>,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            default_limit: default_limit(),
+            default_token_budget: default_token_budget(),
+            budgets: default_budget_presets(),
+        }
+    }
+}
+
+fn default_limit() -> u16 {
+    8
+}
+
+fn default_token_budget() -> u32 {
+    2_000
+}
+
+/// TOML representation of a named budget preset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetPresetConfig {
+    pub name: String,
+    pub token_budget: u32,
+    pub max_results: u16,
+}
+
+fn default_budget_presets() -> Vec<BudgetPresetConfig> {
+    vec![
+        BudgetPresetConfig {
+            name: "small".into(),
+            token_budget: 1_000,
+            max_results: 4,
+        },
+        BudgetPresetConfig {
+            name: "standard".into(),
+            token_budget: 2_000,
+            max_results: 8,
+        },
+        BudgetPresetConfig {
+            name: "large".into(),
+            token_budget: 4_000,
+            max_results: 16,
+        },
+    ]
 }
 
 /// Global settings that are not root-specific.
@@ -73,8 +134,27 @@ impl AppConfig {
                 database_path: paths.default_database_path.display().to_string(),
                 log_level: default_log_level(),
             },
+            retrieval: RetrievalConfig::default(),
             roots: Vec::new(),
         }
+    }
+
+    /// Resolves a named budget preset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::BudgetPresetNotFound`] when the name is unknown.
+    pub fn budget_preset(&self, name: &str) -> Result<BudgetPreset, ConfigError> {
+        self.retrieval
+            .budgets
+            .iter()
+            .find(|preset| preset.name == name)
+            .map(|preset| BudgetPreset {
+                name: preset.name.clone(),
+                token_budget: preset.token_budget,
+                max_results: preset.max_results,
+            })
+            .ok_or_else(|| ConfigError::BudgetPresetNotFound(name.to_owned()))
     }
 
     /// Loads and validates configuration from disk.
@@ -139,6 +219,34 @@ impl AppConfig {
     ///
     /// Returns duplicate name/path or identifier errors.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.retrieval.default_limit == 0 || self.retrieval.default_token_budget == 0 {
+            return Err(ConfigError::Invalid {
+                path: PathBuf::from("config"),
+                message: "retrieval defaults must be greater than zero".into(),
+            });
+        }
+        let mut preset_names = Vec::new();
+        for preset in &self.retrieval.budgets {
+            if preset.name.trim().is_empty() {
+                return Err(ConfigError::Invalid {
+                    path: PathBuf::from("config"),
+                    message: "budget preset name must not be empty".into(),
+                });
+            }
+            if preset.token_budget == 0 || preset.max_results == 0 {
+                return Err(ConfigError::Invalid {
+                    path: PathBuf::from("config"),
+                    message: format!("budget preset '{}' must use non-zero values", preset.name),
+                });
+            }
+            if preset_names.iter().any(|name| name == &preset.name) {
+                return Err(ConfigError::Invalid {
+                    path: PathBuf::from("config"),
+                    message: format!("duplicate budget preset '{}'", preset.name),
+                });
+            }
+            preset_names.push(preset.name.clone());
+        }
         let mut paths = Vec::new();
         let mut names = Vec::new();
         for root in &self.roots {
