@@ -13,13 +13,14 @@ use crate::storage::StorageError;
 
 use crate::config::AppConfig;
 use crate::domain::{
-    ContentHash, ExplanationKind, MatchExplanation, RetrievalHit, RetrievalLimit, RetrievalMode,
-    RetrievalQuery, RetrievalResponse, RetrievalSignals, RevisionId, RootId, SegmentId,
-    SensitivityScope, SourceFileId, SupportedFileType, Timestamp, TokenBudget,
+    ContentHash, EvidenceOrigin, ExplanationKind, MatchExplanation, RetrievalHit, RetrievalLimit,
+    RetrievalMode, RetrievalQuery, RetrievalResponse, RetrievalSignals, RevisionId, RootId,
+    SegmentId, SensitivityScope, SourceFileId, SupportedFileType, Timestamp, TokenBudget,
 };
 use crate::error::RetrievalError;
 use crate::freshness::inspect_freshness;
 use crate::query_parse::{ParsedQuery, parse_lexical_query};
+use crate::snapshot::{eligible_snapshot_sources, open_snapshot_readonly};
 use crate::tokens::{
     HARD_BYTE_CAP, HeuristicTokenEstimator, MAX_HIT_TEXT_BYTES, RESPONSE_OVERHEAD_TOKENS,
     RESULT_OVERHEAD_TOKENS, TokenEstimator, estimate_response_tokens, truncate_utf8,
@@ -105,6 +106,7 @@ pub fn retrieve(
                 channel: "lexical_fts5".into(),
                 raw_bm25: Some(candidate.raw_bm25),
                 public_score,
+                federation_score: None,
             },
             explanation: MatchExplanation {
                 matched_terms,
@@ -115,8 +117,20 @@ pub fn retrieve(
             sensitivity_scope,
             token_estimate,
             truncated,
+            origin: EvidenceOrigin::LocalIndex,
         });
     }
+
+    // Federate eligible imported snapshots via Reciprocal Rank Fusion.
+    hits = federate_with_snapshots(
+        connection,
+        config,
+        request,
+        &parsed,
+        hits,
+        &sensitivity,
+        &mut warnings,
+    );
 
     let packed = pack_results(
         &request.query,
@@ -480,6 +494,241 @@ fn pack_results(
 
 fn hits_remaining_after(selected: &[RetrievalHit], limit: usize) -> bool {
     selected.len() >= limit
+}
+
+/// Maximum imported snapshots consulted per query.
+pub const MAX_SNAPSHOTS_PER_QUERY: usize = 8;
+/// Candidates requested from each snapshot index.
+pub const SNAPSHOT_CANDIDATES: usize = 32;
+/// RRF constant k.
+pub const RRF_K: f32 = 60.0;
+
+fn federate_with_snapshots(
+    connection: &Connection,
+    config: &AppConfig,
+    request: &RetrievalQuery,
+    parsed: &ParsedQuery,
+    local_hits: Vec<RetrievalHit>,
+    sensitivity: &SensitivityIndex,
+    warnings: &mut Vec<String>,
+) -> Vec<RetrievalHit> {
+    let sources = match eligible_snapshot_sources(connection, config, request) {
+        Ok(sources) => sources,
+        Err(error) => {
+            warnings.push(format!("snapshot federation skipped: {error}"));
+            return local_hits;
+        }
+    };
+    if sources.is_empty() {
+        // Local-only path remains stable: score stays public BM25-derived.
+        return local_hits;
+    }
+
+    let mut lists: Vec<Vec<RetrievalHit>> = Vec::new();
+    // Rank local hits as list 0 in current order.
+    lists.push(local_hits.clone());
+
+    for source in sources.into_iter().take(MAX_SNAPSHOTS_PER_QUERY) {
+        match search_snapshot_hits(request, parsed, &source, sensitivity) {
+            Ok(hits) if !hits.is_empty() => lists.push(hits),
+            Ok(_) => {}
+            Err(message) => warnings.push(format!(
+                "snapshot {} excluded: {message}",
+                source.snapshot_id
+            )),
+        }
+    }
+
+    if lists.len() == 1 {
+        return local_hits;
+    }
+
+    rrf_merge(&lists)
+}
+
+#[allow(clippy::too_many_lines)]
+fn search_snapshot_hits(
+    request: &RetrievalQuery,
+    parsed: &ParsedQuery,
+    source: &crate::snapshot::SnapshotSource,
+    sensitivity: &SensitivityIndex,
+) -> Result<Vec<RetrievalHit>, String> {
+    let snap = open_snapshot_readonly(&source.payload_path).map_err(|e| e.to_string())?;
+    // Query snapshot FTS for this snapshot root id, then remap root to local.
+    let mut sql = String::from(
+        "SELECT fts.segment_id, fts.revision_id, fts.source_file_id, fts.root_id,
+                fts.relative_path, fts.anchor, fts.text, s.text_hash, sf.file_type,
+                bm25(segments_fts) AS rank,
+                highlight(segments_fts, 0, '«', '»') AS highlighted
+         FROM segments_fts AS fts
+         INNER JOIN source_files AS sf ON sf.id = fts.source_file_id AND sf.state = 'active'
+           AND sf.current_revision_id = fts.revision_id
+         INNER JOIN segments AS s ON s.id = fts.segment_id
+         WHERE segments_fts MATCH ?1 AND fts.root_id = ?2",
+    );
+    let mut bind: Vec<String> = vec![parsed.fts_match.clone(), source.snapshot_root_id.clone()];
+    if !request.file_types.is_empty() {
+        let base = bind.len() + 1;
+        let placeholders = (0..request.file_types.len())
+            .map(|i| format!("?{}", base + i))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = write!(sql, " AND sf.file_type IN ({placeholders})");
+        for ft in &request.file_types {
+            bind.push(ft.as_str().to_owned());
+        }
+    }
+    sql.push_str(
+        " ORDER BY rank ASC, fts.relative_path ASC, fts.anchor ASC, fts.segment_id ASC LIMIT ?",
+    );
+    let mut statement = snap.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = bind
+        .into_iter()
+        .map(|v| Box::new(v) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    params.push(Box::new(i64::try_from(SNAPSHOT_CANDIDATES).unwrap_or(32)));
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(AsRef::as_ref).collect();
+    let mut rows = statement
+        .query(param_refs.as_slice())
+        .map_err(|e| e.to_string())?;
+    let mut hits = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let relative = PathBuf::from(row.get::<_, String>(4).map_err(|e| e.to_string())?);
+        let local_root = source.local_root_id;
+        if !request.root_ids.is_empty() && !request.root_ids.contains(&local_root) {
+            continue;
+        }
+        if let Some(scope) = sensitivity_for_path(sensitivity, &local_root, &relative) {
+            if scope == SensitivityScope::RequireExplicitQuery && !request.include_sensitive {
+                continue;
+            }
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let raw = row.get::<_, f64>(9).map_err(|e| e.to_string())? as f32;
+        let public = public_score_from_bm25(raw);
+        let text: String = row.get(6).map_err(|e| e.to_string())?;
+        let highlighted: String = row.get(10).map_err(|e| e.to_string())?;
+        let (text, truncated) = truncate_utf8(&text, MAX_HIT_TEXT_BYTES);
+        let matched_terms = matched_terms_for(parsed, &text);
+        let excerpt = excerpt_from_highlight(&highlighted, &text);
+        let token_estimate =
+            u32::try_from(RESULT_OVERHEAD_TOKENS + HeuristicTokenEstimator.estimate(&text))
+                .unwrap_or(1);
+        let file_type =
+            SupportedFileType::from_str(&row.get::<_, String>(8).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        let scope = sensitivity_for_path(sensitivity, &local_root, &relative);
+        hits.push(RetrievalHit {
+            segment_id: SegmentId::from_str(&row.get::<_, String>(0).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?,
+            revision_id: RevisionId::from_str(&row.get::<_, String>(1).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?,
+            source_file_id: SourceFileId::from_str(
+                &row.get::<_, String>(2).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?,
+            root_id: local_root,
+            relative_path: relative,
+            file_type,
+            anchor: row.get(5).map_err(|e| e.to_string())?,
+            text_hash: ContentHash(row.get(7).map_err(|e| e.to_string())?),
+            text,
+            score: public,
+            signals: RetrievalSignals {
+                channel: "snapshot_fts5".into(),
+                raw_bm25: Some(raw),
+                public_score: public,
+                federation_score: None,
+            },
+            explanation: MatchExplanation {
+                matched_terms,
+                matched_excerpt: Some(excerpt),
+                explanation_kind: ExplanationKind::LexicalTermOverlap,
+            },
+            freshness: crate::domain::FreshnessStatus::Unknown,
+            sensitivity_scope: scope,
+            token_estimate,
+            truncated,
+            origin: EvidenceOrigin::Snapshot {
+                snapshot_id: source.snapshot_id.clone(),
+                snapshot_root_id: source.snapshot_root_id.clone(),
+            },
+        });
+    }
+    Ok(hits)
+}
+
+fn rrf_merge(lists: &[Vec<RetrievalHit>]) -> Vec<RetrievalHit> {
+    use std::collections::HashMap;
+    #[derive(Clone)]
+    struct Acc {
+        hit: RetrievalHit,
+        score: f32,
+        local: bool,
+    }
+    let mut best: HashMap<String, Acc> = HashMap::new();
+    for list in lists {
+        for (rank, hit) in list.iter().enumerate() {
+            let key = hit.text_hash.0.clone();
+            #[allow(clippy::cast_precision_loss)]
+            let rank_f = rank as f32;
+            let contrib = 1.0 / (RRF_K + rank_f + 1.0);
+            let is_local = matches!(hit.origin, EvidenceOrigin::LocalIndex);
+            if let Some(existing) = best.get_mut(&key) {
+                // Local exact duplicate wins and keeps accumulating only from local list.
+                if existing.local {
+                    if is_local {
+                        existing.score += contrib;
+                    }
+                } else if is_local {
+                    let mut replaced = hit.clone();
+                    replaced.signals.federation_score = Some(contrib);
+                    replaced.score = contrib;
+                    *existing = Acc {
+                        hit: replaced,
+                        score: contrib,
+                        local: true,
+                    };
+                } else {
+                    existing.score += contrib;
+                }
+            } else {
+                let mut cloned = hit.clone();
+                cloned.signals.federation_score = Some(contrib);
+                cloned.score = contrib;
+                best.insert(
+                    key,
+                    Acc {
+                        hit: cloned,
+                        score: contrib,
+                        local: is_local,
+                    },
+                );
+            }
+        }
+    }
+    let mut merged: Vec<Acc> = best.into_values().collect();
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.hit.relative_path.cmp(&b.hit.relative_path))
+            .then_with(|| a.hit.anchor.cmp(&b.hit.anchor))
+            .then_with(|| {
+                a.hit
+                    .segment_id
+                    .to_string()
+                    .cmp(&b.hit.segment_id.to_string())
+            })
+    });
+    merged
+        .into_iter()
+        .map(|mut acc| {
+            acc.hit.signals.federation_score = Some(acc.score);
+            acc.hit.score = acc.score;
+            acc.hit
+        })
+        .collect()
 }
 
 /// Resolves CLI budget arguments into limit and token budget values.
