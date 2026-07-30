@@ -10,17 +10,25 @@
 ```text
 configuration + approved roots
     → discovery/parse/index (immutable revisions, active FTS)
-    → lexical query (safe MATCH)
-    → BM25 ranking + filters
-    → sensitivity filter + dedupe
-    → freshness metadata inspection
+         ↳ optional Git changed-path selection (same path policy as discovery)
+    → lexical query (safe MATCH) on local active FTS
+    → optional snapshot federation (read-only payloads, RRF)
+    → BM25 / federation ranking + filters
+    → sensitivity filter + exact-hash dedupe (local wins)
+    → freshness metadata inspection (snapshot freshness = unknown)
     → token-budget packing
-    → human/JSON output
+    → human/JSON output with EvidenceOrigin
 ```
 
 ## Lexical ranking
 
 FTS5 `bm25(segments_fts)` is lower-is-better and typically negative. Public `score` is `-raw_bm25` so higher is better. This is **not** normalized to `[0, 1]` and is not comparable with future semantic or hybrid scores. Raw BM25 remains in `RetrievalSignals.raw_bm25`. Tie-breakers: relative path, anchor, segment id ascending. Candidates capped at `min(limit*8, 200)`.
+
+When imported snapshots are eligible, lists are fused with Reciprocal Rank Fusion (`k=60`). Final score becomes the RRF federation score; raw BM25 is retained per channel. Local-only queries keep the BM25 public score path.
+
+## Snapshots
+
+Directory format v1 (`MANIFEST.json` + `payload.sqlite3`). Import is compensating-atomic. Lifecycle: list / inspect / remove. Queryability requires complete explicit root maps. See ADR-0015, ADR-0016, ADR-0017.
 
 ## Token estimation
 
@@ -28,8 +36,8 @@ Heuristic: `ceil(char_count / 3)` plus fixed response/result overhead. Conservat
 
 ## Evaluation
 
-`omnisem eval` materializes `evals/corpus.jsonl` into a temporary root, indexes with production code, runs judged queries, and emits aggregate metrics without touching the user index.
+`omnisem eval` materializes `evals/corpus.jsonl` into a temporary root, indexes with production code, runs judged queries, and emits aggregate metrics without touching the user index. The isolated evaluator does not import snapshots by default.
 
 ## Security
 
-Active revisions only, approved roots only, relative paths in results, safe FTS construction, no source logging, sensitivity filtering before packing, isolated evaluation databases.
+Active revisions only, approved roots only, relative paths in results, safe FTS construction, no source logging, sensitivity filtering before packing, isolated evaluation databases. Incremental indexing shares discovery validation. Status HTTP is loopback-only, method-aware, and omits source/query text.
