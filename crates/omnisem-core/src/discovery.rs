@@ -526,7 +526,7 @@ pub fn classify_supported_file(path: &Path) -> Option<SupportedFileType> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::RootId;
+    use crate::domain::{RootId, Timestamp};
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::time::{Duration, SystemTime};
@@ -542,6 +542,9 @@ mod tests {
             sensitivity_tags: Vec::new(),
             follow_symlinks: follow,
             enabled: true,
+            created_at: Timestamp::from_millis(1),
+            updated_at: Timestamp::from_millis(1),
+            config_fingerprint: "test".into(),
         }
     }
 
