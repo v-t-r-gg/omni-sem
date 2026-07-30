@@ -7,7 +7,10 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::config::AppConfig;
-use crate::discovery::{DEFAULT_MAX_FILE_SIZE_BYTES, DiscoveryOptions, discover_root};
+use crate::discovery::{
+    DEFAULT_MAX_FILE_SIZE_BYTES, DiscoveryOptions, discover_root, is_safe_relative_path,
+    validate_relative_path,
+};
 use crate::domain::{
     ContentHash, DiscoveredDocument, Revision, RevisionId, RevisionStatus, Root, RootId, ScanRun,
     ScanRunId, ScanStatus, Segment, SegmentId, SourceFile, SourceFileId, SourceState, Timestamp,
@@ -270,7 +273,7 @@ fn index_one_root_maybe_incremental(
     let changes = match collect_changes(&root.canonical_path, &ctx, &base) {
         Ok(changes) => changes,
         Err(error) => {
-            return index_one_root_full(
+            let report = index_one_root_full(
                 connection,
                 root,
                 registry,
@@ -278,7 +281,22 @@ fn index_one_root_maybe_incremental(
                 None,
                 Some(ctx.head.clone()),
                 Some(format!("git change collection failed: {error}")),
-            );
+            )?;
+            // Successful full fallback advances the Git base so a bad base is not retried forever.
+            if report.failures == 0 && !report.failed {
+                let _ = upsert_root_git_state(
+                    connection,
+                    &RootGitState {
+                        root_id: root.id.to_string(),
+                        repo_fingerprint: Some(ctx.repo_fingerprint.clone()),
+                        last_indexed_commit: Some(ctx.head.clone()),
+                        observed_head: Some(ctx.head.clone()),
+                        last_incremental_base: None,
+                        last_incremental_at_ms: Some(Timestamp::now()?.as_millis()),
+                    },
+                );
+            }
+            return Ok(report);
         }
     };
 
@@ -291,8 +309,16 @@ fn index_one_root_maybe_incremental(
     let mut segments_indexed = 0_u32;
     let mut explicit_deletions = 0_u32;
     let mut files_discovered = 0_u32;
+    let discovery_options = DiscoveryOptions::default();
+    let root_canonical = root
+        .canonical_path
+        .canonicalize()
+        .unwrap_or_else(|_| root.canonical_path.clone());
 
     for change in &changes {
+        if !is_safe_relative_path(&change.relative_path) {
+            continue;
+        }
         match change.kind {
             GitChangeKind::Deleted => {
                 if let Some(source) = find_source_file(connection, &root.id, &change.relative_path)?
@@ -302,37 +328,17 @@ fn index_one_root_maybe_incremental(
                 }
             }
             GitChangeKind::Added | GitChangeKind::Modified => {
-                let absolute = root.canonical_path.join(&change.relative_path);
-                if !absolute.is_file() {
-                    continue;
-                }
-                let Ok(meta) = std::fs::metadata(&absolute) else {
-                    failures += 1;
-                    continue;
-                };
-                let Ok(modified_at) = meta
-                    .modified()
-                    .ok()
-                    .and_then(|value| Timestamp::try_from_system_time(value).ok())
-                    .ok_or(())
-                else {
-                    failures += 1;
-                    continue;
-                };
-                let Some(file_type) =
-                    crate::discovery::classify_supported_file(&change.relative_path)
-                else {
+                let validated = validate_relative_path(
+                    root,
+                    &root_canonical,
+                    &change.relative_path,
+                    &discovery_options,
+                )
+                .map_err(|error| IndexError::Internal(error.to_string()))?;
+                let Ok(document) = validated else {
                     continue;
                 };
                 files_discovered += 1;
-                let document = DiscoveredDocument {
-                    root_id: root.id,
-                    canonical_path: absolute,
-                    relative_path: change.relative_path.clone(),
-                    size_bytes: meta.len(),
-                    modified_at,
-                    file_type,
-                };
                 match process_document(connection, root, &document, registry) {
                     Ok(DocumentOutcome::Addition { segments }) => {
                         additions += 1;

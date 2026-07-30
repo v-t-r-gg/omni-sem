@@ -85,9 +85,12 @@ pub fn detect_git_root(root_path: &Path) -> Option<GitRootContext> {
 
 /// Lists root-relative changed paths since `base` including untracked files.
 ///
+/// Non-UTF-8 path components abort the entire collection so callers fall back to
+/// a full safe discovery rather than silently omitting deletions or renames.
+///
 /// # Errors
 ///
-/// Returns [`IndexError`] when Git commands fail after repository detection.
+/// Returns [`IndexError`] when Git commands fail or path encoding is invalid.
 pub fn collect_changes(
     root_path: &Path,
     ctx: &GitRootContext,
@@ -110,12 +113,9 @@ pub fn collect_changes(
             base,
         ],
     )?;
-    parse_name_status_z(&diff, ctx, &mut changes);
+    parse_name_status_z(&diff, ctx, &mut changes)?;
 
-    // Also include unstaged/staged against HEAD when base == HEAD is wrong for WIP:
-    // `git diff -z --name-status HEAD` captures working tree + index vs HEAD.
-    // When base is not HEAD, the base diff already includes history; still capture
-    // dirty tree relative to HEAD for tracked files.
+    // Also include unstaged/staged against HEAD when base is not HEAD.
     if base != ctx.head {
         let dirty = run_git_bytes(
             root_path,
@@ -131,7 +131,7 @@ pub fn collect_changes(
                 "HEAD",
             ],
         )?;
-        parse_name_status_z(&dirty, ctx, &mut changes);
+        parse_name_status_z(&dirty, ctx, &mut changes)?;
     }
 
     // Untracked eligible files
@@ -146,7 +146,7 @@ pub fn collect_changes(
             "-z",
         ],
     )?;
-    for path in split_z(&untracked) {
+    for path in split_z(&untracked)? {
         if let Some(rel) = map_repo_path_to_root(ctx, &path) {
             changes.push(GitPathChange {
                 relative_path: rel,
@@ -159,8 +159,12 @@ pub fn collect_changes(
     Ok(changes)
 }
 
-fn parse_name_status_z(bytes: &[u8], ctx: &GitRootContext, out: &mut Vec<GitPathChange>) {
-    let parts = split_z(bytes);
+fn parse_name_status_z(
+    bytes: &[u8],
+    ctx: &GitRootContext,
+    out: &mut Vec<GitPathChange>,
+) -> Result<(), IndexError> {
+    let parts = split_z(bytes)?;
     let mut index = 0;
     while index < parts.len() {
         let status = &parts[index];
@@ -232,6 +236,7 @@ fn parse_name_status_z(bytes: &[u8], ctx: &GitRootContext, out: &mut Vec<GitPath
             }
         }
     }
+    Ok(())
 }
 
 fn map_repo_path_to_root(ctx: &GitRootContext, repo_relative: &str) -> Option<PathBuf> {
@@ -252,12 +257,31 @@ fn map_repo_path_to_root(ctx: &GitRootContext, repo_relative: &str) -> Option<Pa
     path.strip_prefix(prefix).ok().map(Path::to_path_buf)
 }
 
-fn split_z(bytes: &[u8]) -> Vec<String> {
-    bytes
+/// Test seam: reject incomplete incremental results when Git paths are not UTF-8.
+#[doc(hidden)]
+pub fn parse_name_status_z_for_test(
+    bytes: &[u8],
+    ctx: &GitRootContext,
+) -> Result<Vec<GitPathChange>, IndexError> {
+    let mut out = Vec::new();
+    parse_name_status_z(bytes, ctx, &mut out)?;
+    Ok(out)
+}
+
+fn split_z(bytes: &[u8]) -> Result<Vec<String>, IndexError> {
+    let mut out = Vec::new();
+    for chunk in bytes
         .split(|byte| *byte == 0)
         .filter(|chunk| !chunk.is_empty())
-        .filter_map(|chunk| std::str::from_utf8(chunk).ok().map(str::to_owned))
-        .collect()
+    {
+        let text = std::str::from_utf8(chunk).map_err(|_| {
+            IndexError::Internal(
+                "git path is not valid UTF-8; abandoning incomplete incremental result".into(),
+            )
+        })?;
+        out.push(text.to_owned());
+    }
+    Ok(out)
 }
 
 fn dedupe_changes(changes: &mut Vec<GitPathChange>) {

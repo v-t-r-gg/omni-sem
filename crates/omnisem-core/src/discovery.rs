@@ -498,6 +498,141 @@ fn resolve_symlink_within_root(
     Ok((resolved, metadata))
 }
 
+/// Validates a single root-relative path under the full discovery security policy.
+///
+/// Used by both recursive discovery and Git-aware incremental indexing so both
+/// paths share include/exclude, symlink, special-file, size, and containment rules.
+///
+/// # Errors
+///
+/// Returns [`SkipReason`] when the path must not be indexed. Returns
+/// [`DiscoveryError`] only for configuration/pattern compilation failures.
+pub fn validate_relative_path(
+    root: &Root,
+    root_canonical: &Path,
+    relative: &Path,
+    options: &DiscoveryOptions,
+) -> Result<Result<DiscoveredDocument, SkipReason>, DiscoveryError> {
+    if !is_safe_relative_path(relative) {
+        return Ok(Err(SkipReason::OutsideRoot));
+    }
+    if options.ignore_hidden && is_hidden_relative(relative) {
+        return Ok(Err(SkipReason::Hidden));
+    }
+
+    let exclude = compile_patterns(&merged_excludes(root, options))?;
+    let include = compile_optional_patterns(&root.include_patterns)?;
+    let relative_str = relative_to_match_str(relative);
+    if exclude.is_match(&relative_str) {
+        return Ok(Err(SkipReason::ExcludedByRule));
+    }
+    if let Some(include) = include.as_ref()
+        && !include.is_match(&relative_str)
+    {
+        return Ok(Err(SkipReason::NotIncluded));
+    }
+
+    let absolute = root_canonical.join(relative);
+    if options.honor_gitignore && is_path_gitignored(root_canonical, relative, &absolute) {
+        return Ok(Err(SkipReason::IgnoredByGit));
+    }
+    let metadata = match fs::symlink_metadata(&absolute) {
+        Ok(meta) => meta,
+        Err(error) => {
+            return Ok(Err(SkipReason::InvalidMetadata(error.to_string())));
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        if !root.follow_symlinks {
+            return Ok(Err(SkipReason::Symlink));
+        }
+        return match resolve_symlink_within_root(root_canonical, &absolute) {
+            Ok((resolved, resolved_meta)) => {
+                let mut documents = Vec::new();
+                if let Some(skip) = classify_and_collect(
+                    root,
+                    root_canonical,
+                    &resolved,
+                    relative,
+                    &resolved_meta,
+                    &exclude,
+                    include.as_ref(),
+                    options,
+                    &mut documents,
+                ) {
+                    Ok(Err(skip.reason))
+                } else {
+                    Ok(Ok(documents.remove(0)))
+                }
+            }
+            Err(reason) => Ok(Err(reason)),
+        };
+    }
+    if !file_type.is_file() || is_special_file(file_type) {
+        return Ok(Err(if file_type.is_file() {
+            SkipReason::SpecialFile
+        } else {
+            SkipReason::NotAFile
+        }));
+    }
+
+    let mut documents = Vec::new();
+    if let Some(skip) = classify_and_collect(
+        root,
+        root_canonical,
+        &absolute,
+        relative,
+        &metadata,
+        &exclude,
+        include.as_ref(),
+        options,
+        &mut documents,
+    ) {
+        return Ok(Err(skip.reason));
+    }
+    Ok(Ok(documents.remove(0)))
+}
+
+/// Returns whether a relative path is free of absolute and parent components.
+#[must_use]
+pub fn is_safe_relative_path(relative: &Path) -> bool {
+    !relative.is_absolute()
+        && !relative.as_os_str().is_empty()
+        && relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// Applies root-local `.gitignore` / `.git/info/exclude` rules to a single path.
+///
+/// Parent-directory ignore files outside the approved root and host-global
+/// gitignore are intentionally not consulted, matching [`discover_root`].
+fn is_path_gitignored(root_canonical: &Path, relative: &Path, absolute: &Path) -> bool {
+    use ignore::gitignore::GitignoreBuilder;
+
+    let mut builder = GitignoreBuilder::new(root_canonical);
+    let _ = builder.add(root_canonical.join(".gitignore"));
+    let exclude = root_canonical.join(".git/info/exclude");
+    if exclude.is_file() {
+        let _ = builder.add(exclude);
+    }
+    let mut current = root_canonical.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        if current.is_dir() {
+            let nested = current.join(".gitignore");
+            if nested.is_file() {
+                let _ = builder.add(nested);
+            }
+        }
+    }
+    let Ok(matcher) = builder.build() else {
+        return false;
+    };
+    matcher.matched(absolute, false).is_ignore()
+}
+
 /// Classifies a path using extension only. Contents are not inspected.
 #[must_use]
 pub fn classify_supported_file(path: &Path) -> Option<SupportedFileType> {
