@@ -167,13 +167,24 @@ fn mode_unavailable(name: &str) -> RetrievalError {
     ))
 }
 
-/// Public score: higher is better. Raw FTS5 BM25 is lower-is-better.
+/// Maps FTS5 BM25 into a public lexical score.
+///
+/// `SQLite` `FTS5` BM25 is lower-is-better and is typically negative for ordinary
+/// matches (more negative is better). The public score is:
+///
+/// ```text
+/// public_score = -raw_bm25
+/// ```
+///
+/// so higher public scores are better. This is a monotonic transform of the raw
+/// rank value, not a probability and not normalized to `[0, 1]`. Lexical scores
+/// are not comparable with future semantic or hybrid scores.
 #[must_use]
 pub fn public_score_from_bm25(raw_bm25: f32) -> f32 {
     if !raw_bm25.is_finite() {
-        return 0.0;
+        return f32::NEG_INFINITY;
     }
-    1.0 / (1.0 + raw_bm25.max(0.0))
+    -raw_bm25
 }
 
 #[allow(clippy::too_many_lines)]
@@ -624,6 +635,74 @@ mod tests {
 
     #[test]
     fn bm25_public_score_is_higher_for_lower_raw() {
-        assert!(public_score_from_bm25(0.1) > public_score_from_bm25(2.0));
+        // Typical FTS5 BM25 values are negative; more negative is better.
+        assert!(public_score_from_bm25(-3.5) > public_score_from_bm25(-0.5));
+        assert!(public_score_from_bm25(-0.5) > public_score_from_bm25(1.0));
+        assert!((public_score_from_bm25(-2.0) - 2.0).abs() < f32::EPSILON);
+        assert!(public_score_from_bm25(f32::NAN).is_infinite());
+        assert!(public_score_from_bm25(f32::INFINITY).is_infinite());
+    }
+
+    #[test]
+    fn distinct_documents_receive_distinct_bm25_public_scores() {
+        let temp = TempDir::new().unwrap();
+        let paths = AppPaths::for_base(temp.path().join("app"));
+        let (mut config, _) = init_installation(&paths).unwrap();
+        let notes = temp.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(
+            notes.join("focused.md"),
+            "# Focused\n\nSQLite SQLite SQLite is the selected storage engine for Omni-Sem.\n",
+        )
+        .unwrap();
+        fs::write(
+            notes.join("mention.md"),
+            "# Mention\n\nThe notes briefly mention SQLite once among other topics like graphs and agents.\n",
+        )
+        .unwrap();
+        add_root(&mut config, &notes, Some("notes".into())).unwrap();
+        config.save(&paths.config_file).unwrap();
+        let mut connection = open_database(&config.database_path().unwrap()).unwrap();
+        index_roots(&mut connection, &config, None).unwrap();
+
+        let response = retrieve(
+            &connection,
+            &config,
+            &RetrievalQuery {
+                query: "SQLite".into(),
+                root_ids: Vec::new(),
+                file_types: Vec::new(),
+                mode: RetrievalMode::Lexical,
+                limit: RetrievalLimit::new(10).unwrap(),
+                token_budget: TokenBudget::new(4_000).unwrap(),
+                include_sensitive: false,
+                budget_preset: None,
+            },
+        )
+        .unwrap();
+        assert!(response.results.len() >= 2);
+        let first = &response.results[0];
+        let second = &response.results[1];
+        let first_raw = first.signals.raw_bm25.expect("raw bm25");
+        let second_raw = second.signals.raw_bm25.expect("raw bm25");
+        assert!(
+            (first_raw - second_raw).abs() > f32::EPSILON,
+            "expected distinct raw BM25 values, got {first_raw} and {second_raw}"
+        );
+        assert!(
+            (first.score - second.score).abs() > f32::EPSILON,
+            "expected distinct public scores, got {} and {}",
+            first.score,
+            second.score
+        );
+        assert!(
+            first.score > second.score,
+            "better-ranked hit must have higher public score"
+        );
+        assert!(
+            first_raw < second_raw,
+            "better-ranked hit must have lower raw BM25"
+        );
+        assert!(first_raw.is_sign_negative() || first_raw == 0.0);
     }
 }

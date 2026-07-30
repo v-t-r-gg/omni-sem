@@ -20,7 +20,7 @@ configuration + approved roots
 
 ## Lexical ranking
 
-FTS5 `bm25(segments_fts)` is lower-is-better. Public `score` is `1/(1+max(raw,0))` so higher is better. Tie-breakers: relative path, anchor, segment id ascending. Candidates capped at `min(limit*8, 200)`.
+FTS5 `bm25(segments_fts)` is lower-is-better and typically negative. Public `score` is `-raw_bm25` so higher is better. This is **not** normalized to `[0, 1]` and is not comparable with future semantic or hybrid scores. Raw BM25 remains in `RetrievalSignals.raw_bm25`. Tie-breakers: relative path, anchor, segment id ascending. Candidates capped at `min(limit*8, 200)`.
 
 ## Token estimation
 

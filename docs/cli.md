@@ -71,7 +71,7 @@ Options:
 - `--explain`
 - `--json`
 
-Public BM25 scores are higher-is-better (`1/(1+raw_bm25)`). Raw BM25 remains in JSON signals (lower-is-better).
+Public lexical scores are higher-is-better (`public = -raw_bm25`). Raw FTS5 BM25 remains in JSON signals (lower-is-better, often negative). Scores are not probabilities and are not comparable across retrieval modes.
 
 ### `omnisem eval [--corpus PATH] [--mode lexical] [--json]`
 

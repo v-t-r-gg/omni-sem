@@ -15,7 +15,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{add_root, init_installation};
-use crate::domain::{RetrievalLimit, RetrievalMode, RetrievalQuery, TokenBudget};
+use blake3::Hasher;
+
+use crate::domain::{FreshnessStatus, RetrievalLimit, RetrievalMode, RetrievalQuery, TokenBudget};
 use crate::error::{IndexError, RetrievalError};
 use crate::hash::blake3_hex;
 use crate::index::index_roots;
@@ -112,6 +114,8 @@ pub struct EvalHit {
     pub segment_ref: String,
     pub rank: u32,
     pub score: f32,
+    /// Filesystem freshness observed for the hit at evaluation time.
+    pub freshness: FreshnessStatus,
 }
 
 /// Runs evaluation against an isolated temporary installation.
@@ -211,6 +215,7 @@ pub fn run_evaluation(
                 segment_ref: refs[index].clone(),
                 rank: u32::try_from(index + 1).unwrap_or(u32::MAX),
                 score: hit.score,
+                freshness: hit.freshness,
             })
             .collect();
         per_query.push(PerQueryResult {
@@ -399,6 +404,7 @@ fn aggregate_metrics(
     let mut stale_num = 0.0;
     let mut stale_den = 0.0;
     let mut misleading_num = 0.0;
+    let mut misleading_den = 0.0;
     let mut diversity = 0.0;
     for item in per_query {
         let judgment = &judgments[&item.query_id];
@@ -406,14 +412,21 @@ fn aggregate_metrics(
         let mut sources = BTreeSet::new();
         for hit in &item.hits {
             duplicate_den += 1.0;
-            stale_den += 1.0;
+            misleading_den += 1.0;
             if !seen.insert(hit.segment_ref.clone()) {
                 duplicate_num += 1.0;
             }
-            if hit.segment_ref.contains("old") || hit.segment_ref.contains("stale") {
-                // Stale rate is approximated via fixture revision naming in the
-                // reference corpus paths/document ids.
-                stale_num += 1.0;
+            // Stale-result rate uses filesystem freshness only.
+            // Unknown is excluded from the denominator: it is indeterminate, not proven stale.
+            match hit.freshness {
+                FreshnessStatus::PendingReindex => {
+                    stale_num += 1.0;
+                    stale_den += 1.0;
+                }
+                FreshnessStatus::Current => {
+                    stale_den += 1.0;
+                }
+                FreshnessStatus::Unknown => {}
             }
             if judgment
                 .misleading
@@ -444,10 +457,10 @@ fn aggregate_metrics(
         } else {
             stale_num / stale_den
         },
-        misleading_result_rate: if stale_den == 0.0 {
+        misleading_result_rate: if misleading_den == 0.0 {
             0.0
         } else {
-            misleading_num / stale_den
+            misleading_num / misleading_den
         },
         source_diversity: diversity / n,
         returned_tokens,
@@ -499,17 +512,95 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, Retri
     Ok(out)
 }
 
-fn index_fingerprint(connection: &Connection) -> Result<String, RetrievalError> {
-    let count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM segments_fts", [], |row| row.get(0))
+/// Computes a fingerprint of the **active** index surface.
+///
+/// Streams a deterministic ordered projection of content-stable identity fields:
+/// `relative_path | anchor | ordinal | text_hash | content_hash | parser_id | parser_version`
+///
+/// Random row UUIDs are intentionally excluded so equivalent corpora fingerprint
+/// identically across re-indexes. Historical non-current revisions do not contribute.
+/// Raw segment text is not hashed.
+///
+/// # Errors
+///
+/// Returns storage errors when the active index cannot be read.
+pub fn index_fingerprint(connection: &Connection) -> Result<String, RetrievalError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT
+                sf.relative_path,
+                s.anchor,
+                s.ordinal,
+                s.text_hash,
+                rev.content_hash,
+                rev.parser_id,
+                rev.parser_version
+             FROM segments_fts AS fts
+             INNER JOIN source_files AS sf
+                ON sf.id = fts.source_file_id
+               AND sf.state = 'active'
+               AND sf.current_revision_id = fts.revision_id
+             INNER JOIN segments AS s
+                ON s.id = fts.segment_id
+             INNER JOIN revisions AS rev
+                ON rev.id = fts.revision_id
+             ORDER BY
+                sf.relative_path ASC,
+                s.ordinal ASC,
+                s.anchor ASC,
+                s.text_hash ASC",
+        )
         .map_err(crate::storage::StorageError::from)?;
-    Ok(blake3_hex(count.to_string().as_bytes()).0)
+    let mut rows = statement
+        .query([])
+        .map_err(crate::storage::StorageError::from)?;
+    let mut hasher = Hasher::new();
+    let mut count = 0_u64;
+    while let Some(row) = rows.next().map_err(crate::storage::StorageError::from)? {
+        let relative_path: String = row.get(0).map_err(crate::storage::StorageError::from)?;
+        let anchor: String = row.get(1).map_err(crate::storage::StorageError::from)?;
+        let ordinal: i64 = row.get(2).map_err(crate::storage::StorageError::from)?;
+        let text_hash: String = row.get(3).map_err(crate::storage::StorageError::from)?;
+        let content_hash: String = row.get(4).map_err(crate::storage::StorageError::from)?;
+        let parser_id: String = row.get(5).map_err(crate::storage::StorageError::from)?;
+        let parser_version: String = row.get(6).map_err(crate::storage::StorageError::from)?;
+        hasher.update(relative_path.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(anchor.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&ordinal.to_le_bytes());
+        hasher.update(&[0]);
+        hasher.update(text_hash.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(content_hash.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(parser_id.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(parser_version.as_bytes());
+        hasher.update(&[0xff]);
+        count = count.saturating_add(1);
+    }
+    hasher.update(&count.to_le_bytes());
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{add_root, init_installation};
+    use crate::domain::{
+        FreshnessStatus, RetrievalLimit, RetrievalMode, RetrievalQuery, TokenBudget,
+    };
+    use crate::index::index_roots;
+    use crate::paths::AppPaths;
+    use crate::retrieval::retrieve;
+    use crate::storage::open_database;
+    use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     #[test]
     fn reference_bundle_runs_deterministically() {
@@ -520,6 +611,9 @@ mod tests {
         assert!((first.metrics.mrr - second.metrics.mrr).abs() < f64::EPSILON);
         assert_eq!(first.query_count, 2);
         assert!(first.metrics.p95_latency_ms >= 0.0);
+        // Freshly materialized fixtures are current; Unknown is excluded from the denominator.
+        assert!((first.metrics.stale_result_rate - 0.0).abs() < f64::EPSILON);
+        assert_eq!(first.index_fingerprint, second.index_fingerprint);
     }
 
     #[test]
@@ -534,5 +628,136 @@ mod tests {
         let refs = vec!["c#1".into(), "a#1".into(), "b#1".into()];
         assert!((recall_at(&refs, &judgment, 5) - 1.0).abs() < f64::EPSILON);
         assert!((mrr_one(&refs, &judgment) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn stale_rate_uses_freshness_not_path_names() {
+        let hits = vec![
+            EvalHit {
+                segment_ref: "architecture-old#heading:storage".into(),
+                rank: 1,
+                score: 1.0,
+                freshness: FreshnessStatus::Current,
+            },
+            EvalHit {
+                segment_ref: "architecture-current#heading:storage".into(),
+                rank: 2,
+                score: 0.5,
+                freshness: FreshnessStatus::PendingReindex,
+            },
+            EvalHit {
+                segment_ref: "missing#heading".into(),
+                rank: 3,
+                score: 0.1,
+                freshness: FreshnessStatus::Unknown,
+            },
+        ];
+        let per_query = vec![PerQueryResult {
+            query_id: "q".into(),
+            latency_ms: 1.0,
+            returned_tokens: 10,
+            recall_at_5: 1.0,
+            recall_at_10: 1.0,
+            reciprocal_rank: 1.0,
+            ndcg: 1.0,
+            hits,
+        }];
+        let judgments = HashMap::from([(
+            "q".into(),
+            JudgmentRecord {
+                query_id: "q".into(),
+                required: vec!["architecture-current#heading:storage".into()],
+                acceptable: Vec::new(),
+                misleading: Vec::new(),
+                expected_source_diversity: None,
+            },
+        )]);
+        let metrics = aggregate_metrics(&per_query, &judgments, &[1.0]);
+        // Only Current + PendingReindex count; one of two is pending.
+        assert!((metrics.stale_result_rate - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn stale_rate_detects_post_index_filesystem_change() {
+        let temp = TempDir::new().unwrap();
+        let paths = AppPaths::for_base(temp.path().join("app"));
+        let (mut config, _) = init_installation(&paths).unwrap();
+        let notes = temp.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        let file = notes.join("doc.md");
+        fs::write(&file, "# Storage\n\nSQLite is the system of record.\n").unwrap();
+        add_root(&mut config, &notes, Some("notes".into())).unwrap();
+        config.save(&paths.config_file).unwrap();
+        let mut connection = open_database(&config.database_path().unwrap()).unwrap();
+        index_roots(&mut connection, &config, None).unwrap();
+
+        thread::sleep(Duration::from_millis(1_100));
+        let mut handle = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&file)
+            .unwrap();
+        handle
+            .write_all(b"# Storage\n\nSQLite is the system of record (edited).\n")
+            .unwrap();
+        handle.flush().unwrap();
+
+        let response = retrieve(
+            &connection,
+            &config,
+            &RetrievalQuery {
+                query: "SQLite".into(),
+                root_ids: Vec::new(),
+                file_types: Vec::new(),
+                mode: RetrievalMode::Lexical,
+                limit: RetrievalLimit::new(5).unwrap(),
+                token_budget: TokenBudget::new(2_000).unwrap(),
+                include_sensitive: false,
+                budget_preset: None,
+            },
+        )
+        .unwrap();
+        assert!(!response.results.is_empty());
+        assert!(
+            response
+                .results
+                .iter()
+                .any(|hit| hit.freshness == FreshnessStatus::PendingReindex)
+        );
+    }
+
+    #[test]
+    fn index_fingerprint_changes_with_content_not_only_count() {
+        let temp = TempDir::new().unwrap();
+        let paths = AppPaths::for_base(temp.path().join("app"));
+        let (mut config, _) = init_installation(&paths).unwrap();
+        let notes = temp.path().join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("a.md"), "# A\n\nAlpha content about storage.\n").unwrap();
+        add_root(&mut config, &notes, Some("notes".into())).unwrap();
+        config.save(&paths.config_file).unwrap();
+        let mut connection = open_database(&config.database_path().unwrap()).unwrap();
+        index_roots(&mut connection, &config, None).unwrap();
+        let first = index_fingerprint(&connection).unwrap();
+        let again = index_fingerprint(&connection).unwrap();
+        assert_eq!(first, again);
+
+        fs::write(notes.join("b.md"), "# B\n\nBeta content about graphs.\n").unwrap();
+        index_roots(&mut connection, &config, None).unwrap();
+        let with_extra = index_fingerprint(&connection).unwrap();
+        assert_ne!(first, with_extra);
+
+        // Same row count, different text: rewrite a.md content and reindex.
+        fs::write(
+            notes.join("a.md"),
+            "# A\n\nCompletely different alpha text.\n",
+        )
+        .unwrap();
+        // remove b so count can match original if we want; instead compare rewrite keeps count
+        fs::remove_file(notes.join("b.md")).unwrap();
+        index_roots(&mut connection, &config, None).unwrap();
+        let rewritten = index_fingerprint(&connection).unwrap();
+        assert_ne!(first, rewritten);
+        assert_ne!(with_extra, rewritten);
     }
 }
