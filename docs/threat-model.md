@@ -2,23 +2,25 @@
 
 ## Assets and trust boundaries
 
-Source content and the derived database are sensitive. Filesystem contents, Markdown text, MCP callers, and future model output are untrusted. Local configuration and the executable are trusted only within the user's account boundary.
+Source content and the derived database are sensitive. Filesystem contents and future MCP callers are untrusted. Configuration and the executable are trusted within the user account.
 
 ## Principal threats
 
-- path traversal, symlink escape, race conditions, and special-file reads;
-- accidentally indexing secrets or overly broad roots;
-- stale or partial revisions appearing in retrieval;
-- prompt injection in retrieved evidence;
-- protocol injection through standard output;
-- source text leakage through logs, errors, exports, or future network providers;
-- resource exhaustion from large files, requests, or unbounded work;
-- sensitive indexed content leaking through MCP once that surface exists.
+- path traversal, symlink escape, races, special-file reads;
+- broad roots or secret files entering the index;
+- stale/partial revisions appearing active;
+- source text leakage through logs, errors, or status output;
+- resource exhaustion from large files or unbounded suggestion scans;
+- residual FTS rows after root revocation.
 
-## Required controls
+## Controls in this release
 
-Roots require explicit approval and canonical containment checks. Symlink following defaults off. Discovery rejects devices, sockets, pipes, oversized files, root escapes, and documented secret filename patterns. Nested `.gitignore` rules are honored by default; Omni-Sem excludes remain authoritative. Sensitivity tags gate future retrieval visibility without deleting indexed data. Revision promotion is transactional when indexing lands. Retrieved text is labeled untrusted, never executed, and never treated as instructions. Logs exclude text and credentials. Future IPC is user-scoped, authenticated, versioned, bounded, and timeout-controlled.
-
-## Implemented surface
-
-This repository implements discovery and parsers only. No network, MCP, daemon, or source mutation is present. Discovery and parse failures produce typed errors or skip reasons rather than partial persistent revisions (persistence is not yet wired).
+- explicit root approval and revocation;
+- `init` and `root suggest` never index or auto-approve;
+- canonical containment, default no symlink following, special-file skips;
+- size limits at discovery and stable read;
+- metadata double-check during reads (`FILE_CHANGED_DURING_READ`);
+- restrictive config/database permissions on Unix;
+- transactional revision/FTS promotion and root cascade cleanup;
+- errors and CLI output avoid source text;
+- sensitivity tags are stored for later retrieval filtering, not treated as exclusions.

@@ -6,6 +6,15 @@ Omni-Sem is pre-alpha and has no supported release. Security reports are still w
 
 ## Security boundary
 
-Omni-Sem will read only explicitly approved roots. Source documents are immutable and untrusted; derived indexes may contain sensitive text and require the same care as the corpus. The product never claims filename exclusions detect every secret.
+Omni-Sem reads only explicitly approved roots. Source documents remain immutable and untrusted. Derived indexes may contain sensitive text and require the same care as the corpus. Filename exclusions do not detect every secret.
 
-Discovery canonicalizes roots, rejects root escapes and special files, defaults to not following symlinks, honors workspace ignore rules, applies Omni-Sem excludes authoritatively, and enforces a maximum file size. Sensitivity tags are configuration for later retrieval gating; they do not replace exclusion. The CLI still does not mutate sources, open network sockets, or serve MCP.
+Operational controls now include:
+
+- explicit root approval and revocation with derived-data cleanup;
+- canonical root containment and default no symlink following;
+- special-file rejection and size-limited stable reads;
+- restrictive configuration and database permissions on Unix;
+- no source text in logs or standard command summaries;
+- sensitivity tags persisted for later MCP/retrieval filtering.
+
+The product still has no MCP server, network embedding providers, or daemon in this release.

@@ -6,17 +6,14 @@ All notable changes will be documented here. The format follows Keep a Changelog
 
 ### Added
 
-- Authoritative Development Blueprint v0.3.
-- ADR-0007 through ADR-0012 (git-aware incremental indexing, surfaced provenance, personal-knowledge interoperability, sensitivity tags, `ignore` discovery, `pulldown-cmark` Markdown).
-- Domain contracts for plain-text classification, serializable timestamps, and sensitivity tags.
-- Safe ignore-aware discovery for approved roots (`omnisem_core::discovery`).
-- Deterministic `markdown-v1` and `plain-text-v1` parsers behind the existing parser registry.
+- Operational Milestone 1 indexing CLI: `init`, `root add|list|suggest|remove`, `index`, `status`, `changes`.
+- TOML configuration with platform-aware directories, unknown-field denial, and restrictive permissions.
+- Schema v2 migration: timestamps, sensitivity storage, scan runs, and active-only FTS5.
+- BLAKE3 content hashing (`blake3:<hex>`), stable bounded reads, immutable revision promotion.
+- Deletion handling after successful root discovery; root revocation cascade for derived data.
+- ADR-0013 (FTS active surface) and ADR-0014 (BLAKE3 hashing).
+- CLI reference documentation and expanded integration tests.
 
-### Changed
+### Previously
 
-- Package repository metadata now points at `https://github.com/v-t-r-gg/omni-sem`.
-- Architecture, schema, threat-model, development, vision, and dependency documentation updated for the input-pipeline slice.
-
-### Foundation (prior)
-
-- Establish the Rust workspace, domain and parser contracts, SQLite migration scaffold, evaluation formats, CI, and architecture documentation.
+- Blueprint v0.3, discovery, Markdown/plain-text parsers, ADR-0007–0012, foundation workspace.
