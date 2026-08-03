@@ -1,5 +1,7 @@
 # Retrieval evaluation
 
+Milestone 4A does not add semantic evaluation. Evaluation remains lexical-only; lexical/semantic/hybrid comparison is deferred with query-vector generation and vector ranking to Milestone 4B.
+
 ## Bundle layout
 
 ```text

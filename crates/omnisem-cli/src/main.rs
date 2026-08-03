@@ -71,6 +71,11 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         port: u16,
     },
+    /// Run configuration, database, parser, snapshot, and optional provider diagnostics.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
     /// Export or import portable derived-data snapshots.
     Snapshot {
         #[command(subcommand)]
@@ -206,6 +211,7 @@ fn run() -> Result<ExitCode, ExitCode> {
             cmd_index(&paths, root.as_deref(), since, json)
         }
         Some(Command::Status { json, serve, port }) => cmd_status(&paths, json, serve, port),
+        Some(Command::Doctor { json }) => cmd_doctor(&paths, json),
         Some(Command::Snapshot { action }) => cmd_snapshot(&paths, action),
         Some(Command::Changes { since, root, json }) => {
             cmd_changes(&paths, since.as_deref(), root.as_deref(), json)
@@ -482,7 +488,12 @@ fn cmd_index(
     } else {
         print_index_human(&report);
     }
-    if report.failures > 0 {
+    if report.failures > 0
+        || report
+            .embedding
+            .as_ref()
+            .is_some_and(|embedding| matches!(embedding.status.as_str(), "partial" | "failed"))
+    {
         Ok(ExitCode::PartialIndexing)
     } else {
         Ok(ExitCode::Success)
@@ -511,8 +522,23 @@ fn print_index_human(report: &IndexReport) {
     println!("failed: {}", report.failures);
     println!("segments indexed: {}", report.segments_indexed);
     println!("duration_ms: {}", report.duration_ms);
+    if let Some(embedding) = &report.embedding {
+        println!("embedding provider: {}", embedding.provider);
+        println!(
+            "embedding space: {}",
+            embedding.embedding_space.as_deref().unwrap_or("none")
+        );
+        println!("embedding status: {}", embedding.status);
+        println!("embedding active segments: {}", embedding.active_segments);
+        println!("embedding cache hits: {}", embedding.cache_hits);
+        println!("embedding provider inputs: {}", embedding.provider_inputs);
+        println!("embedding linked segments: {}", embedding.linked_segments);
+        println!("embedding missing segments: {}", embedding.missing_segments);
+        println!("embedding failed segments: {}", embedding.failed_segments);
+    }
 }
 
+#[allow(clippy::too_many_lines)]
 fn cmd_status(paths: &AppPaths, json: bool, serve: bool, port: u16) -> Result<ExitCode, ExitCode> {
     let config = load_or_init(paths).map_err(|error| print_config_err(&error))?;
     let database_path = config
@@ -551,6 +577,7 @@ fn cmd_status(paths: &AppPaths, json: bool, serve: bool, port: u16) -> Result<Ex
         last_failed_scan_ms: snapshot.last_failed_scan_ms,
         database_size_bytes: snapshot.database_size_bytes,
         sensitivity_tag_count: snapshot.sensitivity_tag_count,
+        embedding: snapshot.embedding,
     };
     if json {
         print_json(&output).map_err(|error| print_config_err(&error))?;
@@ -568,6 +595,38 @@ fn cmd_status(paths: &AppPaths, json: bool, serve: bool, port: u16) -> Result<Ex
         println!("fts_rows: {}", output.fts_rows);
         println!("failed_sources: {}", output.failed_sources);
         println!(
+            "embedding_space: {}",
+            output
+                .embedding
+                .active_space_id
+                .as_deref()
+                .unwrap_or("none")
+        );
+        println!(
+            "embedding_provider: {}",
+            output.embedding.provider.as_deref().unwrap_or("none")
+        );
+        println!(
+            "embedding_model: {}",
+            output
+                .embedding
+                .canonical_model
+                .as_deref()
+                .unwrap_or("none")
+        );
+        println!(
+            "embedding_digest: {}",
+            output
+                .embedding
+                .model_digest
+                .as_deref()
+                .map_or("none", |value| &value[..value.len().min(12)])
+        );
+        println!(
+            "embedding_coverage: {}/{}",
+            output.embedding.linked_active_segments, output.embedding.active_segments
+        );
+        println!(
             "last_successful_scan_ms: {}",
             output
                 .last_successful_scan_ms
@@ -583,6 +642,120 @@ fn cmd_status(paths: &AppPaths, json: bool, serve: bool, port: u16) -> Result<Ex
         println!("sensitivity_tag_count: {}", output.sensitivity_tag_count);
     }
     Ok(ExitCode::Success)
+}
+
+#[allow(clippy::too_many_lines)]
+fn cmd_doctor(paths: &AppPaths, json: bool) -> Result<ExitCode, ExitCode> {
+    let config = load_or_init(paths).map_err(|error| print_config_err(&error))?;
+    let database_path = config
+        .database_path()
+        .map_err(|error| print_config_err(&error))?;
+    let connection = open_database(&database_path).map_err(|error| {
+        eprintln!("error: {error}");
+        ExitCode::Database
+    })?;
+    let mut checks = vec![
+        DoctorCheck::pass("configuration", "configuration is valid"),
+        DoctorCheck::pass("database", "database is available"),
+    ];
+    let snapshot = status_snapshot(&connection, &database_path).map_err(|error| {
+        eprintln!("error: {error}");
+        ExitCode::Database
+    })?;
+    checks.push(DoctorCheck::pass(
+        "schema",
+        &format!("schema version {}", snapshot.schema_version),
+    ));
+    let fts = connection
+        .query_row("SELECT COUNT(*) FROM segments_fts", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .is_ok();
+    checks.push(if fts {
+        DoctorCheck::pass("fts5", "FTS5 is available")
+    } else {
+        DoctorCheck::failure("fts5", "FTS5 is unavailable")
+    });
+    let inaccessible = config
+        .roots
+        .iter()
+        .filter(|root| root.enabled && !Path::new(&root.path).is_dir())
+        .count();
+    checks.push(if inaccessible == 0 {
+        DoctorCheck::pass("roots", "enabled roots are accessible")
+    } else {
+        DoctorCheck::failure(
+            "roots",
+            &format!("{inaccessible} enabled roots are inaccessible"),
+        )
+    });
+    checks.push(
+        match omnisem_core::parsing::ParserRegistry::with_defaults() {
+            Ok(_) => DoctorCheck::pass("parsers", "parsers are available"),
+            Err(_) => DoctorCheck::failure("parsers", "parser registry is unavailable"),
+        },
+    );
+    if config.embeddings.enabled {
+        match omnisem_core::embedding::diagnose_provider(&config.embeddings) {
+            Ok(Some(model)) => checks.push(DoctorCheck::pass(
+                "embedding_provider",
+                &format!(
+                    "model {} digest {}",
+                    model.canonical_name,
+                    &model.model_digest[..model.model_digest.len().min(12)]
+                ),
+            )),
+            Ok(None) => checks.push(DoctorCheck::disabled(
+                "embedding_provider",
+                "embeddings are disabled",
+            )),
+            Err(error) => checks.push(DoctorCheck::failure("embedding_provider", error.code())),
+        }
+    } else {
+        checks.push(DoctorCheck::disabled(
+            "embedding_provider",
+            "embeddings are disabled; no provider request made",
+        ));
+    }
+    checks.push(DoctorCheck {
+        name: "embedding_coverage".into(),
+        status: if snapshot.embedding.missing_active_segments == 0 {
+            "pass"
+        } else {
+            "warning"
+        }
+        .into(),
+        message: format!(
+            "{}/{} active segments linked; {} failures",
+            snapshot.embedding.linked_active_segments,
+            snapshot.embedding.active_segments,
+            snapshot.embedding.current_failure_count
+        ),
+    });
+    let snapshot_health = omnisem_core::snapshot::list_snapshots(&connection).is_ok();
+    checks.push(if snapshot_health {
+        DoctorCheck::pass("snapshots", "snapshot registry is healthy")
+    } else {
+        DoctorCheck::failure("snapshots", "snapshot registry is unhealthy")
+    });
+    let failed = checks.iter().any(|check| check.status == "failure");
+    let output = DoctorOutput {
+        overall: if failed { "failure" } else { "pass" }.into(),
+        checks,
+    };
+    if json {
+        print_json(&output).map_err(|error| print_config_err(&error))?;
+    } else {
+        for check in &output.checks {
+            println!("{}: {} - {}", check.name, check.status, check.message);
+        }
+        println!("overall: {}", output.overall);
+    }
+    Ok(if failed {
+        ExitCode::PartialIndexing
+    } else {
+        ExitCode::Success
+    })
 }
 
 fn cmd_changes(
@@ -1008,4 +1181,41 @@ struct StatusOutput {
     last_failed_scan_ms: Option<i64>,
     database_size_bytes: u64,
     sensitivity_tag_count: i64,
+    embedding: omnisem_core::storage::EmbeddingStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorOutput {
+    overall: String,
+    checks: Vec<DoctorCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorCheck {
+    name: String,
+    status: String,
+    message: String,
+}
+impl DoctorCheck {
+    fn pass(name: &str, message: &str) -> Self {
+        Self {
+            name: name.into(),
+            status: "pass".into(),
+            message: message.into(),
+        }
+    }
+    fn failure(name: &str, message: &str) -> Self {
+        Self {
+            name: name.into(),
+            status: "failure".into(),
+            message: message.into(),
+        }
+    }
+    fn disabled(name: &str, message: &str) -> Self {
+        Self {
+            name: name.into(),
+            status: "disabled".into(),
+            message: message.into(),
+        }
+    }
 }

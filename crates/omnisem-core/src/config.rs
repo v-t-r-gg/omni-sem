@@ -372,6 +372,10 @@ impl AppConfig {
 
 impl EmbeddingConfig {
     /// Validates the explicit network and compatibility contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error for unsafe, missing, or contradictory values.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let invalid = |message: &str| ConfigError::Invalid {
             path: PathBuf::from("config.embeddings"),
@@ -670,6 +674,7 @@ mystery = true
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn embedding_validation_rejects_ambiguous_and_unsafe_values() {
         let mut value = EmbeddingConfig::default();
         value.enabled = true;

@@ -1,5 +1,7 @@
 # Local status HTTP service
 
+Embedding projections come only from persisted schema v4 state: safe space/model metadata, dimensions, coverage, failures, and latest sync. The service never contacts Ollama and never exposes endpoint URLs, vectors, source/query text, or provider bodies.
+
 ## Bind
 
 `omnisem status --serve [--port N]` listens on `127.0.0.1` only. Port `0` is ephemeral.

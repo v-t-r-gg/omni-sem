@@ -21,6 +21,8 @@ omnisem --data-root PATH <command>
 | 7 | protocol failure |
 | 70 | internal error |
 
+Embedding failures after successful lexical indexing use exit 6.
+
 ## Commands
 
 ### `omnisem init [--json]`
@@ -95,6 +97,8 @@ Lifecycle without exposing managed absolute paths, exporter machine paths, or so
 
 ### Status HTTP (`omnisem status --serve`)
 
+CLI and server status include persisted active embedding space/model/digest, dimensions, coverage, failures, and latest sync. They never contact Ollama and never expose endpoint URLs, source/query text, vectors, or provider bodies.
+
 Supported methods and routes:
 
 | Method | Paths |
@@ -109,6 +113,10 @@ Supported methods and routes:
 - Security headers: CSP, nosniff, DENY frame, no-referrer, no-store
 - Generic `500` bodies (no SQLite/filesystem strings)
 - JSON includes registered/queryable/unhealthy snapshot counts
+
+### `omnisem doctor [--json]`
+
+Checks configuration, database/schema/FTS, roots, parsers, embedding feature/configuration, provider/model, coverage/failures, and snapshot registry. Disabled embeddings return `disabled` successfully without network access. Enabled Ollama resolves `/api/tags`; doctor does not call `/api/embed` or `/api/pull`.
 
 ### Query provenance
 

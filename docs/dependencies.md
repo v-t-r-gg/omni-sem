@@ -13,5 +13,9 @@
 | `pulldown-cmark` | Markdown events | comrak | pure Rust, default features off | MIT |
 | `blake3` | content hashing | sha2 | pure Rust (+SIMD) | Apache-2.0/CC0 |
 | `tempfile` (dev) | fixtures | manual temps | test-only | MIT/Apache-2.0 |
+| `url` 2.5.8 | strict endpoint parsing | hand URI parsing | default features retained; pure Rust plus IDNA/ICU | MIT/Apache-2.0 |
+| `ureq` 3.3.0 (optional) | blocking Ollama HTTP | reqwest-blocking, minreq | defaults off, `rustls` only; no native TLS | MIT/Apache-2.0 |
 
-Unsafe code is forbidden in workspace crates. SQLite remains the only intentional native boundary.
+`ureq` is exposed by default feature `embeddings-ollama`; `--no-default-features` removes it and configured Ollama returns `EMBEDDING_FEATURE_DISABLED` while lexical operations work. `reqwest` was rejected for its larger async graph; `minreq` for its smaller ecosystem/policy surface. `url` avoids security-sensitive hand parsing. Rustls supplies TLS; no new direct dependency adds native code. The agent explicitly disables environment proxies and redirects. Compile impact is the Rustls and URL/IDNA graph; binary-size impact was not separately measured.
+
+Unsafe code is forbidden in workspace crates. Bundled SQLite remains the intentional native boundary.

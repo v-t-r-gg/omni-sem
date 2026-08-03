@@ -756,6 +756,7 @@ pub struct EmbeddingStatus {
 /// # Errors
 ///
 /// Returns database errors.
+#[allow(clippy::too_many_lines)]
 pub fn status_snapshot(
     connection: &Connection,
     database_path: &Path,
@@ -1030,6 +1031,71 @@ mod tests {
             .query_row("SELECT version FROM schema_metadata", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    fn database_at(version: i64) -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_metadata(singleton,version) VALUES(1,1)",
+                [],
+            )
+            .unwrap();
+        if version >= 2 {
+            connection.execute_batch(MIGRATION_2).unwrap();
+            connection
+                .execute("UPDATE schema_metadata SET version=2", [])
+                .unwrap();
+        }
+        if version >= 3 {
+            connection.execute_batch(MIGRATION_3).unwrap();
+            connection
+                .execute("UPDATE schema_metadata SET version=3", [])
+                .unwrap();
+        }
+        connection
+    }
+
+    #[test]
+    fn upgrades_from_schema_v2_and_v3() {
+        for version in [2, 3] {
+            let mut connection = database_at(version);
+            migrate(&mut connection).unwrap();
+            assert_eq!(schema_version(&connection).unwrap(), Some(4));
+        }
+    }
+
+    #[test]
+    fn failed_embedding_migration_rolls_back() {
+        let mut connection = database_at(3);
+        connection
+            .execute_batch("CREATE TABLE embedding_spaces(id TEXT PRIMARY KEY);")
+            .unwrap();
+        assert!(migrate(&mut connection).is_err());
+        assert_eq!(schema_version(&connection).unwrap(), Some(3));
+        let cache_exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='embedding_vectors'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_exists, 0);
+    }
+
+    #[test]
+    fn embedding_cache_is_unique_and_space_isolated() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        for id in ["es_a", "es_b"] {
+            connection.execute("INSERT INTO embedding_spaces(id,provider,canonical_model,model_digest,dimensions,normalization,input_contract_version,created_at_ms,config_fingerprint) VALUES(?1,'ollama','m',?1,8,'l2','v1',0,?1)",[id]).unwrap();
+        }
+        let bytes = vec![0_u8; 32];
+        connection.execute("INSERT INTO embedding_vectors(embedding_space_id,text_hash,vector_bytes,dimensions,created_at_ms) VALUES('es_a','blake3:x',?1,8,0)",[&bytes]).unwrap();
+        assert!(connection.execute("INSERT INTO embedding_vectors(embedding_space_id,text_hash,vector_bytes,dimensions,created_at_ms) VALUES('es_a','blake3:x',?1,8,0)",[&bytes]).is_err());
+        connection.execute("INSERT INTO embedding_vectors(embedding_space_id,text_hash,vector_bytes,dimensions,created_at_ms) VALUES('es_b','blake3:x',?1,8,0)",[&bytes]).unwrap();
+        assert!(connection.execute("INSERT INTO embedding_vectors(embedding_space_id,text_hash,vector_bytes,dimensions,created_at_ms) VALUES('es_a','blake3:y',x'00',8,0)",[]).is_err());
     }
 
     #[test]

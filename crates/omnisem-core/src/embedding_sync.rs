@@ -1,4 +1,12 @@
 //! Active-segment embedding materialization after lexical indexing commits.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::map_unwrap_or,
+    clippy::needless_pass_by_value,
+    clippy::too_many_lines
+)]
 
 use std::collections::BTreeMap;
 use std::time::Instant;

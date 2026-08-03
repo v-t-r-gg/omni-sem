@@ -4,6 +4,12 @@ All notable changes will be documented here. The format follows Keep a Changelog
 
 ## Unreleased
 
+### Added (Milestone 4A)
+
+- Safe-default embedding configuration and feature-gated blocking Ollama transport using `/api/tags` and `/api/embed`.
+- Schema v4 digest-aware embedding spaces, normalized binary f32 cache, active-segment backfill, failure state, and bounded sync history.
+- Persisted embedding status and `omnisem doctor`; snapshot format 1 and retrieval remain lexical-only.
+
 ### Added
 
 - Milestone 3 complete boundary:

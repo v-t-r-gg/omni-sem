@@ -4,6 +4,8 @@
 
 Source content and the derived database are sensitive. Filesystem contents and future MCP callers are untrusted. Configuration and the executable are trusted within the user account.
 
+Embedding network access is deny-by-default. Only explicit enabled Ollama configuration and an operation needing provider access (`index`, or model resolution in `doctor`) may contact the validated HTTP(S) endpoint. Redirects and environment proxies are disabled, credentials in URLs are rejected, paths and response sizes are fixed/bounded, and source text/provider bodies are excluded from diagnostics. Status reads persisted state only.
+
 ## Principal threats
 
 - path traversal, symlink escape, races, special-file reads;

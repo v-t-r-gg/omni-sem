@@ -1,4 +1,12 @@
 //! Embedding provider contracts, deterministic spaces, and vector encoding.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::map_unwrap_or,
+    clippy::unused_self,
+    clippy::wildcard_imports
+)]
 
 use std::fmt;
 
@@ -505,6 +513,7 @@ mod tests {
 
     #[cfg(feature = "embeddings-ollama")]
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn ollama_uses_current_bounded_endpoints() {
         use crate::config::{EmbeddingConfig, EmbeddingProviderConfig};
         use std::io::{Read, Write};
