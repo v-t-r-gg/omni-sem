@@ -56,7 +56,9 @@ Row UUIDs are omitted so equivalent corpora fingerprint identically across re-in
 
 Evaluation always builds a temporary data root and database. The user’s configured index is never modified. Imported snapshots are **not** part of the default evaluation path; reference lexical metrics remain local-only unless a bundle explicitly includes snapshots.
 
-`omnisem eval --compare` reports lexical, semantic, and hybrid metrics plus semantic-minus-lexical and hybrid-minus-lexical deltas. Results depend on corpus and exact model digest; the report does not assert that one mode is intrinsically superior. Provider/model cold start and corpus materialization are excluded from per-query latency and reported separately as corpus embedding time.
+`omnisem eval --compare` materializes and indexes one physical temporary corpus, resolves and pins one model identity, synchronizes embeddings once, and runs lexical, semantic, and hybrid queries against that shared connection and embedding space. All reports carry identical configuration/index fingerprints and one shared embedding identity and corpus-embedding duration. Results depend on corpus and exact model digest; the report does not assert that one mode is intrinsically superior.
+
+Per-query and aggregate telemetry separates query-embedding and exact-vector-scan latency and reports p50/p95 values, active vectors examined, corrupt exclusions, local/snapshot/semantic candidate counts, fusion admissions, unique fused candidates, and duplicate suppression. Corpus synchronization is excluded from query latency.
 
 ## Snapshot federation (runtime query, not default eval)
 

@@ -9,19 +9,56 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use omnisem_core::config::{add_root, init_installation};
+use omnisem_core::config::{EmbeddingProviderConfig, add_root, init_installation};
 use omnisem_core::discovery::{DiscoveryOptions, is_safe_relative_path, validate_relative_path};
 use omnisem_core::domain::{
     EvidenceOrigin, RetrievalLimit, RetrievalMode, RetrievalQuery, TokenBudget,
 };
+use omnisem_core::embedding::{
+    EmbeddingBatch, EmbeddingError, EmbeddingInput, EmbeddingProvider, EmbeddingProviderKind,
+    EmbeddingVector, ResolvedEmbeddingModel,
+};
+use omnisem_core::embedding_sync::synchronize_with_provider;
 use omnisem_core::git::{GitChangeKind, collect_changes, detect_git_root};
 use omnisem_core::index::{IndexOptions, index_roots, index_roots_with_options};
 use omnisem_core::paths::AppPaths;
-use omnisem_core::retrieval::retrieve;
+use omnisem_core::retrieval::{
+    RetrievalRuntime, SqliteExactVectorSearch, retrieve, retrieve_with_runtime,
+};
 use omnisem_core::snapshot::{export_snapshot, import_snapshot, list_snapshots, remove_snapshot};
 use omnisem_core::status_server::serve_status;
 use omnisem_core::storage::{list_active_source_files, open_database, status_snapshot};
 use tempfile::TempDir;
+
+struct HybridFake;
+impl EmbeddingProvider for HybridFake {
+    fn provider_kind(&self) -> EmbeddingProviderKind {
+        EmbeddingProviderKind::Ollama
+    }
+    fn resolve_model(&self) -> Result<ResolvedEmbeddingModel, EmbeddingError> {
+        Ok(ResolvedEmbeddingModel {
+            provider: EmbeddingProviderKind::Ollama,
+            configured_name: "hybrid".into(),
+            canonical_name: "hybrid:latest".into(),
+            model_digest: "sha256:hybrid".into(),
+            dimensions: Some(8),
+        })
+    }
+    fn embed(
+        &self,
+        inputs: &[EmbeddingInput],
+        _: &ResolvedEmbeddingModel,
+    ) -> Result<EmbeddingBatch, EmbeddingError> {
+        Ok(EmbeddingBatch {
+            vectors: inputs
+                .iter()
+                .map(|_| EmbeddingVector {
+                    values: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                })
+                .collect(),
+        })
+    }
+}
 
 fn init_repo(path: &Path) {
     assert!(
@@ -355,6 +392,17 @@ fn snapshot_federation_local_precedence_and_remove() {
         "# Shared\n\nfederation unique token alphazebra\n",
     )
     .unwrap();
+    fs::write(
+        a_notes.join("snapshot-only.md"),
+        "# Snapshot\n\nalphazebra distinct snapshot evidence\n",
+    )
+    .unwrap();
+    fs::create_dir_all(a_notes.join("private")).unwrap();
+    fs::write(
+        a_notes.join("private/secret.md"),
+        "# Private\n\nalphazebra private snapshot evidence\n",
+    )
+    .unwrap();
     let a_root = add_root(&mut a_config, &a_notes, Some("notes".into())).unwrap();
     a_config.save(&a_paths.config_file).unwrap();
     let mut a_conn = open_database(&a_config.database_path().unwrap()).unwrap();
@@ -370,6 +418,12 @@ fn snapshot_federation_local_precedence_and_remove() {
     // Local file with different content first — snapshot-only evidence.
     fs::write(b_notes.join("local-only.md"), "# Local\n\nlocalonlytoken\n").unwrap();
     let b_root = add_root(&mut b_config, &b_notes, Some("notes".into())).unwrap();
+    b_config.roots[0]
+        .sensitivity
+        .push(omnisem_core::config::SensitivityConfig {
+            pattern: "private/**".into(),
+            scope: "require_explicit_query".into(),
+        });
     b_config.save(&b_paths.config_file).unwrap();
     let mut b_conn = open_database(&b_config.database_path().unwrap()).unwrap();
     index_roots(&mut b_conn, &b_config, None).unwrap();
@@ -442,6 +496,132 @@ fn snapshot_federation_local_precedence_and_remove() {
             .any(|h| matches!(h.origin, EvidenceOrigin::LocalIndex)),
         "local evidence should win exact text-hash duplicate"
     );
+    assert!(
+        response2
+            .results
+            .iter()
+            .filter(|hit| matches!(hit.origin, EvidenceOrigin::Snapshot { .. }))
+            .all(|hit| hit.signals.lexical_rank.is_some())
+    );
+
+    b_config.embeddings.enabled = true;
+    b_config.embeddings.provider = EmbeddingProviderConfig::Ollama;
+    b_config.embeddings.endpoint = "http://127.0.0.1:1".into();
+    b_config.embeddings.model = "hybrid".into();
+    b_config.embeddings.dimensions = 8;
+    synchronize_with_provider(&mut b_conn, &b_config.embeddings, &HybridFake).unwrap();
+    let hybrid = retrieve_with_runtime(
+        &b_conn,
+        &b_config,
+        &RetrievalQuery {
+            query: "alphazebra".into(),
+            root_ids: Vec::new(),
+            file_types: Vec::new(),
+            mode: RetrievalMode::Hybrid,
+            limit: RetrievalLimit::new(10).unwrap(),
+            token_budget: TokenBudget::new(4_000).unwrap(),
+            include_sensitive: false,
+            budget_preset: None,
+        },
+        &RetrievalRuntime {
+            embedding_provider: Some(&HybridFake),
+            vector_search: &SqliteExactVectorSearch::default(),
+        },
+    )
+    .unwrap();
+    assert!(hybrid.telemetry.local_lexical_candidates > 0);
+    assert!(hybrid.telemetry.snapshot_lexical_candidates > 0);
+    assert!(hybrid.telemetry.semantic_candidates > 0);
+    let local_vectors: u32 = b_conn.query_row("SELECT count(*) FROM segment_embeddings se JOIN segments s ON s.id=se.segment_id JOIN source_files sf ON sf.current_revision_id=s.revision_id AND sf.state='active'", [], |row| row.get(0)).unwrap();
+    assert_eq!(hybrid.telemetry.active_vectors_examined, local_vectors);
+    assert!(
+        hybrid
+            .results
+            .iter()
+            .any(|hit| matches!(hit.origin, EvidenceOrigin::Snapshot { .. })
+                && hit.text.contains("distinct snapshot"))
+    );
+    assert!(
+        hybrid
+            .results
+            .iter()
+            .all(|hit| !hit.relative_path.starts_with("private"))
+    );
+    let duplicate = hybrid
+        .results
+        .iter()
+        .find(|hit| hit.text.contains("federation unique token"))
+        .unwrap();
+    assert!(matches!(duplicate.origin, EvidenceOrigin::LocalIndex));
+    assert!(duplicate.signals.lexical_rank.is_some() && duplicate.signals.semantic_rank.is_some());
+    assert!(duplicate.signals.raw_bm25.is_some() && duplicate.signals.cosine_similarity.is_some());
+    assert_eq!(duplicate.signals.fusion_score, Some(duplicate.score));
+    assert!(hybrid.telemetry.candidates_admitted_to_fusion <= 768);
+    let sensitive = retrieve_with_runtime(
+        &b_conn,
+        &b_config,
+        &RetrievalQuery {
+            query: "alphazebra".into(),
+            root_ids: vec![b_root.id.parse().unwrap()],
+            file_types: vec![omnisem_core::domain::SupportedFileType::Markdown],
+            mode: RetrievalMode::Hybrid,
+            limit: RetrievalLimit::new(10).unwrap(),
+            token_budget: TokenBudget::new(4_000).unwrap(),
+            include_sensitive: true,
+            budget_preset: None,
+        },
+        &RetrievalRuntime {
+            embedding_provider: Some(&HybridFake),
+            vector_search: &SqliteExactVectorSearch::default(),
+        },
+    )
+    .unwrap();
+    assert!(sensitive.results.iter().any(|hit| {
+        hit.relative_path.starts_with("private")
+            && matches!(hit.origin, EvidenceOrigin::Snapshot { .. })
+    }));
+
+    let payload = PathBuf::from(
+        b_conn
+            .query_row(
+                "SELECT payload_path FROM snapshots WHERE id=?1",
+                [&imported.snapshot_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+    );
+    fs::write(&payload, b"unhealthy").unwrap();
+    let unhealthy = retrieve_with_runtime(
+        &b_conn,
+        &b_config,
+        &RetrievalQuery {
+            query: "alphazebra".into(),
+            root_ids: Vec::new(),
+            file_types: Vec::new(),
+            mode: RetrievalMode::Hybrid,
+            limit: RetrievalLimit::new(10).unwrap(),
+            token_budget: TokenBudget::new(4_000).unwrap(),
+            include_sensitive: false,
+            budget_preset: None,
+        },
+        &RetrievalRuntime {
+            embedding_provider: Some(&HybridFake),
+            vector_search: &SqliteExactVectorSearch::default(),
+        },
+    )
+    .unwrap();
+    assert!(
+        unhealthy
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("snapshot"))
+    );
+    assert!(
+        unhealthy
+            .results
+            .iter()
+            .any(|hit| hit.signals.semantic_rank.is_some())
+    );
 
     remove_snapshot(&mut b_conn, &imported.snapshot_id).unwrap();
     let response3 = retrieve(
@@ -467,6 +647,32 @@ fn snapshot_federation_local_precedence_and_remove() {
         "snapshot evidence must disappear after remove"
     );
     assert!(list_snapshots(&b_conn).unwrap().is_empty());
+    let after_remove = retrieve_with_runtime(
+        &b_conn,
+        &b_config,
+        &RetrievalQuery {
+            query: "alphazebra".into(),
+            root_ids: Vec::new(),
+            file_types: Vec::new(),
+            mode: RetrievalMode::Hybrid,
+            limit: RetrievalLimit::new(10).unwrap(),
+            token_budget: TokenBudget::new(4_000).unwrap(),
+            include_sensitive: false,
+            budget_preset: None,
+        },
+        &RetrievalRuntime {
+            embedding_provider: Some(&HybridFake),
+            vector_search: &SqliteExactVectorSearch::default(),
+        },
+    )
+    .unwrap();
+    assert_eq!(after_remove.telemetry.snapshot_lexical_candidates, 0);
+    assert!(
+        after_remove
+            .results
+            .iter()
+            .all(|hit| matches!(hit.origin, EvidenceOrigin::LocalIndex))
+    );
 }
 
 #[test]

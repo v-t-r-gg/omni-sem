@@ -131,4 +131,6 @@ JSON hits include `origin` (`local_index` or `snapshot` with ids). Human output 
 
 The query JSON envelope is version 2 and includes `requested_mode`, effective `mode`, `score_kind`, lexical/semantic ranks, cosine similarity, fusion score, and embedding-space ID when applicable.
 
+Its structured `telemetry` object reports bounded timings and candidate counts without query text, hashes, vectors, endpoints, credentials, or provider bodies. Lexical ranks are one-based within the local FTS list or the contributing snapshot list; semantic ranks are one-based within the local vector list.
+
 `omnisem eval --mode lexical|semantic|hybrid` runs an isolated evaluation. `omnisem eval --compare` produces all three reports and deltas. Semantic-capable evaluation requires explicit enabled embedding configuration.

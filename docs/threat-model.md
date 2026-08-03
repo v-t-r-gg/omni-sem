@@ -43,3 +43,5 @@ Cache rows are untrusted derived data: synchronization validates stored dimensio
 Semantic and hybrid retrieval send query text once to the explicitly configured embedding provider. Query text, hashes, and vectors are not persisted or cached. Errors are bounded and omit endpoint URLs, credentials, provider bodies, and query content. Lexical retrieval is provider-inert. Auto may make this request only after embeddings have been explicitly enabled.
 
 Exact vector search decodes and validates persisted bytes, excludes corrupt candidates with a bounded warning, and refuses to scan more than 50,000 eligible active vectors. It retains at most 200 semantic candidates and admits at most 768 channel candidates to fusion.
+
+The 50,000-vector bound is evaluated against the complete compatible active space before request filters. Telemetry exposes only durations and bounded counts, never query material or provider transport data.

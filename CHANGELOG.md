@@ -49,3 +49,6 @@ All notable changes will be documented here. The format follows Keep a Changelog
 - Add bounded exact cosine search over active local vectors and semantic explanations.
 - Add semantic, hybrid, and auto retrieval with one-pass lexical/snapshot/vector RRF.
 - Add isolated semantic/hybrid evaluation and comparative metric deltas.
+- Preserve one-based lexical and semantic channel ranks through one-pass fusion.
+- Run comparison evaluation on one pinned-model, single-materialization temporary index.
+- Add privacy-safe query-embedding, exact-scan, channel, and fusion telemetry.
