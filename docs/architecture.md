@@ -3,7 +3,7 @@
 ## Crates
 
 - `omnisem-core`: domain, config, discovery, parsers, indexing, retrieval, evaluation.
-- `omnisem-cli`: command surface, output formatting, exit-code mapping.
+- `omnisem-cli`: command surface, output formatting, exit-code mapping, and the feature-gated MCP wire adapter.
 
 ## Operational pipeline
 
@@ -55,3 +55,11 @@ Active revisions only, approved roots only, relative paths in results, safe FTS 
 The production `retrieve` wrapper preserves a provider-free lexical path. Semantic-capable calls construct only the explicitly configured provider and invoke `retrieve_with_runtime`, whose provider and `VectorSearch` boundaries are injectable for deterministic tests. Model resolution and query embedding are synchronous and occur without an open SQLite transaction. Query vectors exist only on the stack/heap for one invocation.
 
 The schema-v4 exact scanner joins segment references to current revisions, active files, and enabled roots, then applies request and sensitivity filters before ranking. Hybrid fusion accepts local lexical, per-snapshot lexical, and local semantic ranked lists in one RRF pass.
+
+## Read-only MCP boundary
+
+`McpContextService` is a synchronous, transport-neutral application service in `omnisem-core`. It opens request-scoped read-only SQLite connections and owns search, strict resource resolution, hydration, and safe status projection. MCP handlers contain no SQL, ranking, filesystem traversal, or embedding logic.
+
+The feature-gated CLI adapter uses the official SDK over STDIO. Tokio owns protocol I/O only; a four-permit semaphore and `spawn_blocking` dispatch synchronous core/provider work away from the executor. Stdout is reserved for JSON-RPC while diagnostics use stderr. EOF ends the server cleanly.
+
+The `Mcp` retrieval audience excludes both sensitive scopes before candidates affect ranks, scan limits, fusion, deduplication, or token packing. Snapshot evidence remains lexical-only. Hydration rechecks current revision, active source, enabled root, healthy complete snapshot mapping, and sensitivity.

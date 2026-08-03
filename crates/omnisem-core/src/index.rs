@@ -148,20 +148,21 @@ pub fn index_roots_with_options(
                 let report =
                     index_one_root_full(connection, &root, &registry, None, None, None, None)?;
                 // Record Git head after successful full scans so later `--since` has a base.
-                if report.failures == 0 && !report.failed {
-                    if let Some(ctx) = crate::git::detect_git_root(&root.canonical_path) {
-                        let _ = crate::storage::upsert_root_git_state(
-                            connection,
-                            &crate::storage::RootGitState {
-                                root_id: root.id.to_string(),
-                                repo_fingerprint: Some(ctx.repo_fingerprint),
-                                last_indexed_commit: Some(ctx.head.clone()),
-                                observed_head: Some(ctx.head),
-                                last_incremental_base: None,
-                                last_incremental_at_ms: None,
-                            },
-                        );
-                    }
+                if report.failures == 0
+                    && !report.failed
+                    && let Some(ctx) = crate::git::detect_git_root(&root.canonical_path)
+                {
+                    let _ = crate::storage::upsert_root_git_state(
+                        connection,
+                        &crate::storage::RootGitState {
+                            root_id: root.id.to_string(),
+                            repo_fingerprint: Some(ctx.repo_fingerprint),
+                            last_indexed_commit: Some(ctx.head.clone()),
+                            observed_head: Some(ctx.head),
+                            last_incremental_base: None,
+                            last_incremental_at_ms: None,
+                        },
+                    );
                 }
                 report
             }

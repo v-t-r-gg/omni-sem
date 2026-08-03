@@ -12,7 +12,7 @@ use std::process::Command;
 use omnisem_core::config::{EmbeddingProviderConfig, add_root, init_installation};
 use omnisem_core::discovery::{DiscoveryOptions, is_safe_relative_path, validate_relative_path};
 use omnisem_core::domain::{
-    EvidenceOrigin, RetrievalLimit, RetrievalMode, RetrievalQuery, TokenBudget,
+    EvidenceOrigin, RetrievalAudience, RetrievalLimit, RetrievalMode, RetrievalQuery, TokenBudget,
 };
 use omnisem_core::embedding::{
     EmbeddingBatch, EmbeddingError, EmbeddingInput, EmbeddingProvider, EmbeddingProviderKind,
@@ -24,6 +24,7 @@ use omnisem_core::index::{IndexOptions, index_roots, index_roots_with_options};
 use omnisem_core::paths::AppPaths;
 use omnisem_core::retrieval::{
     RetrievalRuntime, SqliteExactVectorSearch, retrieve, retrieve_with_runtime,
+    retrieve_with_runtime_for_audience,
 };
 use omnisem_core::snapshot::{export_snapshot, import_snapshot, list_snapshots, remove_snapshot};
 use omnisem_core::status_server::serve_status;
@@ -403,6 +404,12 @@ fn snapshot_federation_local_precedence_and_remove() {
         "# Private\n\nalphazebra private snapshot evidence\n",
     )
     .unwrap();
+    fs::create_dir_all(a_notes.join("never")).unwrap();
+    fs::write(
+        a_notes.join("never/blocked.md"),
+        "# Never\n\nalphazebra never MCP snapshot evidence\n",
+    )
+    .unwrap();
     let a_root = add_root(&mut a_config, &a_notes, Some("notes".into())).unwrap();
     a_config.save(&a_paths.config_file).unwrap();
     let mut a_conn = open_database(&a_config.database_path().unwrap()).unwrap();
@@ -417,12 +424,24 @@ fn snapshot_federation_local_precedence_and_remove() {
     fs::create_dir_all(&b_notes).unwrap();
     // Local file with different content first — snapshot-only evidence.
     fs::write(b_notes.join("local-only.md"), "# Local\n\nlocalonlytoken\n").unwrap();
+    fs::create_dir_all(b_notes.join("never")).unwrap();
+    fs::write(
+        b_notes.join("never/local-blocked.md"),
+        "# Never\n\nalphazebra never MCP local evidence\n",
+    )
+    .unwrap();
     let b_root = add_root(&mut b_config, &b_notes, Some("notes".into())).unwrap();
     b_config.roots[0]
         .sensitivity
         .push(omnisem_core::config::SensitivityConfig {
             pattern: "private/**".into(),
             scope: "require_explicit_query".into(),
+        });
+    b_config.roots[0]
+        .sensitivity
+        .push(omnisem_core::config::SensitivityConfig {
+            pattern: "never/**".into(),
+            scope: "never_return_to_mcp".into(),
         });
     b_config.save(&b_paths.config_file).unwrap();
     let mut b_conn = open_database(&b_config.database_path().unwrap()).unwrap();
@@ -557,6 +576,47 @@ fn snapshot_federation_local_precedence_and_remove() {
     assert!(duplicate.signals.raw_bm25.is_some() && duplicate.signals.cosine_similarity.is_some());
     assert_eq!(duplicate.signals.fusion_score, Some(duplicate.score));
     assert!(hybrid.telemetry.candidates_admitted_to_fusion <= 768);
+    assert!(
+        hybrid
+            .results
+            .iter()
+            .any(|hit| hit.relative_path.starts_with("never"))
+    );
+    let mcp_hybrid = retrieve_with_runtime_for_audience(
+        &b_conn,
+        &b_config,
+        &RetrievalQuery {
+            query: "alphazebra".into(),
+            root_ids: Vec::new(),
+            file_types: Vec::new(),
+            mode: RetrievalMode::Hybrid,
+            limit: RetrievalLimit::new(10).unwrap(),
+            token_budget: TokenBudget::new(4_000).unwrap(),
+            include_sensitive: false,
+            budget_preset: None,
+        },
+        &RetrievalRuntime {
+            embedding_provider: Some(&HybridFake),
+            vector_search: &SqliteExactVectorSearch::default(),
+        },
+        RetrievalAudience::Mcp,
+    )
+    .unwrap();
+    assert!(
+        mcp_hybrid.telemetry.local_lexical_candidates < hybrid.telemetry.local_lexical_candidates
+    );
+    assert!(
+        mcp_hybrid.telemetry.snapshot_lexical_candidates
+            < hybrid.telemetry.snapshot_lexical_candidates
+    );
+    assert!(mcp_hybrid.telemetry.semantic_candidates < hybrid.telemetry.semantic_candidates);
+    assert!(
+        mcp_hybrid
+            .results
+            .iter()
+            .all(|hit| !hit.relative_path.starts_with("never")
+                && !hit.relative_path.starts_with("private"))
+    );
     let sensitive = retrieve_with_runtime(
         &b_conn,
         &b_config,

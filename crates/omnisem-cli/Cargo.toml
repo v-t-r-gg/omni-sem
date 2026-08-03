@@ -8,8 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["embeddings-ollama"]
+default = ["embeddings-ollama", "mcp"]
 embeddings-ollama = ["omnisem-core/embeddings-ollama"]
+mcp = ["dep:rmcp", "dep:schemars", "dep:tokio"]
 
 [[bin]]
 name = "omnisem"
@@ -18,9 +19,12 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 omnisem-core = { path = "../omnisem-core", default-features = false }
+rmcp = { workspace = true, optional = true }
+schemars = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

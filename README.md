@@ -2,7 +2,7 @@
 
 Omni-Sem is a local-first, read-only semantic indexing service for AI agents.
 
-## Operational now (Milestone 4B)
+## Operational now (Milestone 5)
 
 ```text
 omnisem init
@@ -14,6 +14,7 @@ omnisem snapshot export|import|list|inspect|remove
 omnisem status [--serve] [--port N]
 omnisem doctor
 omnisem changes
+omnisem mcp
 ```
 
 Capabilities:
@@ -24,6 +25,7 @@ Capabilities:
 - portable sensitive derived-data snapshots with validation, explicit root mapping, lifecycle commands, and **federated lexical retrieval** (RRF) after complete mapping;
 - local loopback read-only status HTTP view with method-aware GET/HEAD contracts.
 - optional explicitly configured Ollama embedding materialization with digest-isolated spaces and a model-aware vector cache.
+- read-only MCP over STDIO for bounded search, context hydration, and persisted status.
 
 Embeddings are disabled by default and fresh installs make no network requests. Enabling Ollama permits requests only to the configured HTTP(S) endpoint during `index`, semantic/hybrid queries, auto queries that attempt hybrid, semantic/hybrid evaluation, and provider checks in `doctor`; Omni-Sem never pulls a model. Query text is sent only to that explicit provider and query vectors are transient. Lexical query and evaluation remain provider-inert. Embedding failure leaves lexical revisions and FTS valid, and a later `index` backfills unchanged active segments. Vectors are derived and rebuildable.
 
@@ -31,9 +33,10 @@ Imported snapshots are queryable only after every snapshot root is explicitly ma
 
 Semantic retrieval scans compatible active local vectors exactly, with a 50,000-vector safety bound. Hybrid retrieval combines local lexical, each eligible snapshot lexical list, and local semantic evidence in one RRF pass; BM25 and cosine values are never compared directly. Snapshot format 1 remains lexical-only.
 
-## Not yet implemented (Milestone 5+)
+`omnisem mcp` exposes only approved indexed evidence. It cannot index, manage roots, read arbitrary paths, execute source text, or mutate the database. MCP evidence is explicitly marked untrusted, and content tagged `NeverReturnToMcp` or `RequireExplicitQuery` is excluded before ranking. See [MCP client setup](docs/mcp-client-setup.md).
 
-- MCP
+## Not yet implemented (Milestone 6+)
+
 - filesystem watcher / persistent daemon
 - ANN/vector extensions and portable snapshot vectors
 - in-process embedding providers

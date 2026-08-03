@@ -2,7 +2,7 @@
 
 ## Assets and trust boundaries
 
-Source content and the derived database are sensitive. Filesystem contents and future MCP callers are untrusted. Configuration and the executable are trusted within the user account.
+Source content, MCP callers, and the derived database are untrusted or sensitive. Configuration and the executable are trusted within the user account.
 
 Embedding network access is deny-by-default. Only explicit enabled Ollama configuration and an operation needing provider access (`index`, model resolution in `doctor`, semantic/hybrid retrieval, auto attempting hybrid, or semantic-capable evaluation) may contact the validated HTTP(S) endpoint. Redirects and environment proxies are disabled, credentials in URLs are rejected, paths and response sizes are fixed/bounded, and source text/provider bodies are excluded from diagnostics. Status reads persisted state only.
 
@@ -20,6 +20,8 @@ Cache rows are untrusted derived data: synchronization validates stored dimensio
 - orphan managed payloads or path deletion outside the managed snapshots directory;
 - resource exhaustion from large files, unbounded suggestion scans, or many federated snapshots;
 - residual FTS rows after root revocation; snapshot evidence remaining after root disable/remove.
+- source text attempting prompt injection, fake JSON-RPC, or tool invocation through an MCP response;
+- arbitrary-path or malformed-resource requests attempting to turn MCP into filesystem access.
 
 ## Controls in this release
 
@@ -38,6 +40,10 @@ Cache rows are untrusted derived data: synchronization validates stored dimensio
 - errors and CLI/status output avoid source text and absolute managed paths;
 - status HTTP: loopback bind, method enforcement, header limits, generic 500s, security headers;
 - sensitivity tags gate retrieval visibility, including imported snapshot relative paths.
+- MCP audience filtering occurs before ranking/fusion and has no sensitive override;
+- strict `omnisem://` UUID resource grammar, with no query, fragment, credentials, percent encoding, traversal, or filesystem fallback;
+- request-scoped read-only SQLite connections and no MCP migrations or mutation tools;
+- source text is returned only as `untrusted_source_evidence`; it never re-enters protocol dispatch.
 ## Semantic query privacy
 
 Semantic and hybrid retrieval send query text once to the explicitly configured embedding provider. Query text, hashes, and vectors are not persisted or cached. Errors are bounded and omit endpoint URLs, credentials, provider bodies, and query content. Lexical retrieval is provider-inert. Auto may make this request only after embeddings have been explicitly enabled.

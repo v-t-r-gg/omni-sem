@@ -2935,6 +2935,8 @@ Acceptance criteria:
 
 ## Milestone 5: MCP proof of product
 
+Implementation note: implemented on the Milestone 5 feature branch with the official Rust MCP SDK over STDIO. The transport-neutral core service provides bounded search, hydration, strict resources, and persisted status; MCP sensitivity filtering occurs before channel ranking and packing. Schema 4 and lexical-only snapshot format 1 are unchanged. Daemon, HTTP transport, write tools, and graph work remain deferred.
+
 Deliverables:
 
 * STDIO MCP server;

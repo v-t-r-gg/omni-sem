@@ -733,6 +733,11 @@ pub fn eligible_snapshot_sources(
     config: &crate::config::AppConfig,
     request: &crate::domain::RetrievalQuery,
 ) -> Result<Vec<SnapshotSource>, ConfigError> {
+    let queryable: std::collections::HashSet<String> = list_snapshots(connection)?
+        .into_iter()
+        .filter(|snapshot| snapshot.queryable)
+        .map(|snapshot| snapshot.snapshot_id)
+        .collect();
     let mut statement = connection
         .prepare(
             "SELECT s.id, s.payload_path, m.snapshot_root_id, m.local_root_id
@@ -770,6 +775,9 @@ pub fn eligible_snapshot_sources(
                 path: PathBuf::from("db"),
                 message: error.to_string(),
             })?;
+        if !queryable.contains(&snapshot_id) {
+            continue;
+        }
         if !enabled.contains(&local_root) {
             continue;
         }

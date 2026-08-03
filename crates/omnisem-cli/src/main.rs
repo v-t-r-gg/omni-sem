@@ -29,6 +29,9 @@ use omnisem_core::storage::{
 use omnisem_core::suggest::suggest_roots;
 use serde::Serialize;
 
+#[cfg(feature = "mcp")]
+mod mcp_stdio;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "omnisem",
@@ -45,6 +48,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve the read-only Model Context Protocol over STDIO.
+    Mcp,
     /// Create configuration and database layout without indexing.
     Init {
         #[arg(long)]
@@ -209,6 +214,7 @@ fn run() -> Result<ExitCode, ExitCode> {
             println!("Run `omnisem --help` for available commands.");
             Ok(ExitCode::Success)
         }
+        Some(Command::Mcp) => cmd_mcp(&paths),
         Some(Command::Init { json }) => {
             cmd_init(&paths, json).map_err(|error| print_config_err(&error))
         }
@@ -253,6 +259,32 @@ fn run() -> Result<ExitCode, ExitCode> {
             json,
         }) => cmd_eval(&paths, corpus.as_deref(), &mode, compare, json),
     }
+}
+
+#[cfg(feature = "mcp")]
+fn cmd_mcp(paths: &AppPaths) -> Result<ExitCode, ExitCode> {
+    let config = AppConfig::load(&paths.config_file).map_err(|error| {
+        eprintln!(
+            "error: MCP_PROTOCOL_ERROR: configuration unavailable ({})",
+            error.exit_code().code()
+        );
+        error.exit_code()
+    })?;
+    let database_path = config.database_path().map_err(|error| {
+        eprintln!("error: MCP_PROTOCOL_ERROR: database configuration unavailable");
+        error.exit_code()
+    })?;
+    mcp_stdio::serve(config, database_path).map_err(|message| {
+        eprintln!("error: {message}");
+        ExitCode::Protocol
+    })?;
+    Ok(ExitCode::Success)
+}
+
+#[cfg(not(feature = "mcp"))]
+fn cmd_mcp(_paths: &AppPaths) -> Result<ExitCode, ExitCode> {
+    eprintln!("error: MCP_FEATURE_DISABLED: this build does not include MCP support");
+    Err(ExitCode::Protocol)
 }
 
 fn resolve_paths(data_root: Option<&PathBuf>) -> Result<AppPaths, ConfigError> {
