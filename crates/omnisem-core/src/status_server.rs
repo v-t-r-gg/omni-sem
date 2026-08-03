@@ -11,9 +11,13 @@ use std::time::Duration;
 use rusqlite::Connection;
 use serde::Serialize;
 
+use crate::config::EmbeddingConfig;
 use crate::error::ConfigError;
 use crate::snapshot::list_snapshots;
-use crate::storage::{QueryActivitySample, StatusSnapshot, list_query_activity, status_snapshot};
+use crate::storage::{
+    EmbeddingCompatibility, QueryActivitySample, StatusSnapshot, embedding_compatibility,
+    list_query_activity, status_snapshot,
+};
 
 const MAX_REQUEST_LINE: usize = 2_048;
 const MAX_HEADER_BYTES: usize = 8_192;
@@ -49,7 +53,11 @@ impl StatusServer {
 /// # Errors
 ///
 /// Returns configuration/IO failures when binding or opening the database fails.
-pub fn serve_status(database_path: &Path, port: u16) -> Result<StatusServer, ConfigError> {
+pub fn serve_status(
+    database_path: &Path,
+    embeddings: &EmbeddingConfig,
+    port: u16,
+) -> Result<StatusServer, ConfigError> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr).map_err(|error| ConfigError::Io {
         path: PathBuf::from("127.0.0.1"),
@@ -60,9 +68,10 @@ pub fn serve_status(database_path: &Path, port: u16) -> Result<StatusServer, Con
         message: error.to_string(),
     })?;
     let db = database_path.to_path_buf();
+    let embeddings = embeddings.clone();
     let shutdown = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&shutdown);
-    let join = thread::spawn(move || accept_loop(listener, db, flag));
+    let join = thread::spawn(move || accept_loop(listener, db, embeddings, flag));
     thread::sleep(Duration::from_millis(10));
     Ok(StatusServer {
         addr: bound,
@@ -72,7 +81,12 @@ pub fn serve_status(database_path: &Path, port: u16) -> Result<StatusServer, Con
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn accept_loop(listener: TcpListener, database_path: PathBuf, shutdown: Arc<AtomicBool>) {
+fn accept_loop(
+    listener: TcpListener,
+    database_path: PathBuf,
+    embeddings: EmbeddingConfig,
+    shutdown: Arc<AtomicBool>,
+) {
     let _ = listener.set_nonblocking(false);
     while !shutdown.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -80,14 +94,18 @@ fn accept_loop(listener: TcpListener, database_path: PathBuf, shutdown: Arc<Atom
                 if shutdown.load(Ordering::SeqCst) {
                     break;
                 }
-                let _ = handle_client(stream, &database_path);
+                let _ = handle_client(stream, &database_path, &embeddings);
             }
             Err(_) => break,
         }
     }
 }
 
-fn handle_client(mut stream: TcpStream, database_path: &Path) -> Result<(), ()> {
+fn handle_client(
+    mut stream: TcpStream,
+    database_path: &Path,
+    embeddings: &EmbeddingConfig,
+) -> Result<(), ()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let mut buf = vec![0_u8; MAX_HEADER_BYTES + 1];
     let n = stream.read(&mut buf).map_err(|_| ())?;
@@ -181,7 +199,7 @@ fn handle_client(mut stream: TcpStream, database_path: &Path) -> Result<(), ()> 
     let (code, body, content_type) = match normalize_path(path) {
         "/" => (200, html_home().into_bytes(), "text/html; charset=utf-8"),
         "/health" | "/healthz" => (200, b"ok\n".to_vec(), "text/plain; charset=utf-8"),
-        "/status.json" | "/api/status" => json_status(database_path),
+        "/status.json" | "/api/status" => json_status(database_path, embeddings),
         "/api/roots" => json_roots(database_path),
         "/api/activity" => json_activity(database_path),
         _ => (404, b"not found\n".to_vec(), "text/plain; charset=utf-8"),
@@ -279,6 +297,7 @@ fn html_home() -> String {
 #[derive(Serialize)]
 struct StatusPayload {
     snapshot: StatusSnapshot,
+    embedding_compatibility: EmbeddingCompatibility,
     snapshots: SnapshotStatusSummary,
     warning: &'static str,
 }
@@ -301,7 +320,7 @@ fn open_readonly(path: &Path) -> Result<Connection, String> {
     .map_err(|_| "database unavailable".into())
 }
 
-fn json_status(database_path: &Path) -> (u16, Vec<u8>, &'static str) {
+fn json_status(database_path: &Path, embeddings: &EmbeddingConfig) -> (u16, Vec<u8>, &'static str) {
     match open_readonly(database_path).and_then(|connection| {
         let snapshot = status_snapshot(&connection, database_path)
             .map_err(|_| "status unavailable".to_owned())?;
@@ -314,8 +333,10 @@ fn json_status(database_path: &Path) -> (u16, Vec<u8>, &'static str) {
             .iter()
             .map(|item| item.total_roots.saturating_sub(item.mapped_roots))
             .sum();
+        let compatibility = embedding_compatibility(embeddings, &snapshot.embedding);
         let payload = StatusPayload {
             snapshot,
+            embedding_compatibility: compatibility,
             snapshots: SnapshotStatusSummary {
                 registered,
                 queryable,
@@ -403,7 +424,7 @@ mod tests {
         let mut connection = open_database(&db).unwrap();
         index_roots(&mut connection, &config, None).unwrap();
         drop(connection);
-        let server = serve_status(&db, 0).unwrap();
+        let server = serve_status(&db, &config.embeddings, 0).unwrap();
         (temp, db, server)
     }
 
@@ -433,6 +454,8 @@ mod tests {
         assert!(bad.contains("400"));
         let status = request(addr, "GET /status.json HTTP/1.1\r\nHost: localhost\r\n\r\n");
         assert!(status.contains("200 OK"));
+        assert!(status.contains("embedding_compatibility"));
+        assert!(status.contains("\"state\": \"disabled\""));
         assert!(!status.contains(temp_path_marker()));
         server.shutdown();
     }

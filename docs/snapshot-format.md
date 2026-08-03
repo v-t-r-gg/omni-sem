@@ -12,7 +12,11 @@ Directory export is the supported packaging. Tar is not required.
 
 ## Manifest
 
-Required fields include format version (`1`), schema compatibility `{min,max}`, payload checksum (BLAKE3 hex), root descriptors with nonempty unique logical IDs, nonnegative counts, empty `embedding_spaces` for Milestone 3, allowed capabilities (`lexical_fts5`, `read_only_retrieval`), and a sensitivity warning string.
+Required fields include format version (`1`), schema compatibility `{min,max}`, payload checksum (BLAKE3 hex), root descriptors with nonempty unique logical IDs, nonnegative counts, empty `embedding_spaces`, allowed capabilities (`lexical_fts5`, `read_only_retrieval`), and a sensitivity warning string.
+
+Snapshot v1 remains lexical-only. Local caches and vectors are not exported, and import rejects nonempty `embedding_spaces`. Imported evidence cannot participate in semantic retrieval; portable vectors require a future format revision.
+
+Schema compatibility is `2..=4`; schema v4 support does not change the v1 payload or add vectors.
 
 ## Payload
 

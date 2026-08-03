@@ -14,11 +14,12 @@ use crate::hash::blake3_hex;
 use crate::paths::restrict_permissions;
 
 /// Current schema version understood by this executable.
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_1: &str = include_str!("../../../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../../../migrations/0002_operational_indexing.sql");
 const MIGRATION_3: &str = include_str!("../../../migrations/0003_m3_incremental_snapshots.sql");
+const MIGRATION_4: &str = include_str!("../../../migrations/0004_embedding_foundation.sql");
 
 /// Applies every pending migration transactionally.
 ///
@@ -45,6 +46,9 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
     }
     if schema_version(connection)?.unwrap_or(0) < 3 {
         apply(connection.transaction()?, 3, MIGRATION_3)?;
+    }
+    if schema_version(connection)?.unwrap_or(0) < 4 {
+        apply(connection.transaction()?, 4, MIGRATION_4)?;
     }
     Ok(())
 }
@@ -726,6 +730,73 @@ pub struct StatusSnapshot {
     pub last_successful_scan_ms: Option<i64>,
     pub last_failed_scan_ms: Option<i64>,
     pub database_size_bytes: u64,
+    pub embedding: EmbeddingStatus,
+}
+
+/// Persisted-only embedding health projection. Reading it never contacts a provider.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct EmbeddingStatus {
+    pub space_exists: bool,
+    pub active_space_id: Option<String>,
+    pub provider: Option<String>,
+    pub canonical_model: Option<String>,
+    pub model_digest: Option<String>,
+    pub dimensions: Option<u32>,
+    pub normalization: Option<String>,
+    pub active_segments: i64,
+    pub linked_active_segments: i64,
+    pub missing_active_segments: i64,
+    pub current_failure_count: i64,
+    pub latest_sync_status: Option<String>,
+    pub latest_sync_completed_at_ms: Option<i64>,
+}
+
+/// Network-free comparison of configured compatibility fields with the active space.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EmbeddingCompatibility {
+    pub configured_enabled: bool,
+    pub configured_provider: String,
+    pub configured_model: Option<String>,
+    pub configured_dimensions: Option<u32>,
+    pub state: String,
+}
+
+/// Compares fields available without resolving a mutable model tag.
+#[must_use]
+pub fn embedding_compatibility(
+    config: &crate::config::EmbeddingConfig,
+    status: &EmbeddingStatus,
+) -> EmbeddingCompatibility {
+    let provider = match config.provider {
+        crate::config::EmbeddingProviderConfig::None => "none",
+        crate::config::EmbeddingProviderConfig::Ollama => "ollama",
+    };
+    let configured_model = (!config.model.is_empty()).then(|| config.model.clone());
+    let configured_dimensions = (config.dimensions != 0).then_some(config.dimensions);
+    let canonical_candidate = if config.model.contains(':') {
+        config.model.clone()
+    } else {
+        format!("{}:latest", config.model)
+    };
+    let state = if !config.enabled {
+        "disabled"
+    } else if !status.space_exists {
+        "missing_active_space"
+    } else if status.provider.as_deref() != Some(provider)
+        || status.canonical_model.as_deref() != Some(canonical_candidate.as_str())
+        || configured_dimensions.is_some_and(|value| status.dimensions != Some(value))
+    {
+        "incompatible"
+    } else {
+        "compatible_requires_digest_resolution"
+    };
+    EmbeddingCompatibility {
+        configured_enabled: config.enabled,
+        configured_provider: provider.into(),
+        configured_model,
+        configured_dimensions,
+        state: state.into(),
+    }
 }
 
 /// Collects operational status counters.
@@ -733,6 +804,7 @@ pub struct StatusSnapshot {
 /// # Errors
 ///
 /// Returns database errors.
+#[allow(clippy::too_many_lines)]
 pub fn status_snapshot(
     connection: &Connection,
     database_path: &Path,
@@ -796,6 +868,47 @@ pub fn status_snapshot(
         )
         .optional()?;
     let database_size_bytes = std::fs::metadata(database_path).map_or(0, |meta| meta.len());
+    let active_space_id: Option<String> = connection
+        .query_row(
+            "SELECT active_embedding_space_id FROM embedding_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let space_fields = active_space_id.as_ref().and_then(|id| connection.query_row("SELECT provider,canonical_model,model_digest,dimensions,normalization FROM embedding_spaces WHERE id=?1", [id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,u32>(3)?,row.get::<_,String>(4)?))).optional().ok().flatten());
+    let linked_active_segments = if let Some(id) = &active_space_id {
+        connection.query_row("SELECT COUNT(*) FROM segment_embeddings e JOIN source_files f ON f.current_revision_id=e.revision_id WHERE f.state='active' AND e.embedding_space_id=?1",[id],|row|row.get(0))?
+    } else {
+        0
+    };
+    let current_failure_count = if let Some(id) = &active_space_id {
+        connection.query_row("SELECT COUNT(*) FROM embedding_failures ef JOIN segments s ON s.id=ef.segment_id JOIN source_files f ON f.current_revision_id=s.revision_id WHERE f.state='active' AND ef.embedding_space_id=?1",[id],|row|row.get(0))?
+    } else {
+        0
+    };
+    let latest_sync: Option<(String, Option<i64>)> = connection
+        .query_row(
+            "SELECT status,completed_at_ms FROM embedding_sync_runs ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let embedding = EmbeddingStatus {
+        space_exists: active_space_id.is_some(),
+        active_space_id,
+        provider: space_fields.as_ref().map(|v| v.0.clone()),
+        canonical_model: space_fields.as_ref().map(|v| v.1.clone()),
+        model_digest: space_fields.as_ref().map(|v| v.2.clone()),
+        dimensions: space_fields.as_ref().map(|v| v.3),
+        normalization: space_fields.as_ref().map(|v| v.4.clone()),
+        active_segments,
+        linked_active_segments,
+        missing_active_segments: active_segments.saturating_sub(linked_active_segments),
+        current_failure_count,
+        latest_sync_status: latest_sync.as_ref().map(|v| v.0.clone()),
+        latest_sync_completed_at_ms: latest_sync.and_then(|v| v.1),
+    };
     Ok(StatusSnapshot {
         schema_version,
         root_count,
@@ -809,6 +922,7 @@ pub fn status_snapshot(
         last_successful_scan_ms,
         last_failed_scan_ms,
         database_size_bytes,
+        embedding,
     })
 }
 
@@ -967,6 +1081,71 @@ mod tests {
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
     }
 
+    fn database_at(version: i64) -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATION_1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_metadata(singleton,version) VALUES(1,1)",
+                [],
+            )
+            .unwrap();
+        if version >= 2 {
+            connection.execute_batch(MIGRATION_2).unwrap();
+            connection
+                .execute("UPDATE schema_metadata SET version=2", [])
+                .unwrap();
+        }
+        if version >= 3 {
+            connection.execute_batch(MIGRATION_3).unwrap();
+            connection
+                .execute("UPDATE schema_metadata SET version=3", [])
+                .unwrap();
+        }
+        connection
+    }
+
+    #[test]
+    fn upgrades_from_schema_v2_and_v3() {
+        for version in [2, 3] {
+            let mut connection = database_at(version);
+            migrate(&mut connection).unwrap();
+            assert_eq!(schema_version(&connection).unwrap(), Some(4));
+        }
+    }
+
+    #[test]
+    fn failed_embedding_migration_rolls_back() {
+        let mut connection = database_at(3);
+        connection
+            .execute_batch("CREATE TABLE embedding_spaces(id TEXT PRIMARY KEY);")
+            .unwrap();
+        assert!(migrate(&mut connection).is_err());
+        assert_eq!(schema_version(&connection).unwrap(), Some(3));
+        let cache_exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='embedding_vectors'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_exists, 0);
+    }
+
+    #[test]
+    fn embedding_cache_is_unique_and_space_isolated() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate(&mut connection).unwrap();
+        for id in ["es_a", "es_b"] {
+            connection.execute("INSERT INTO embedding_spaces(id,provider,canonical_model,model_digest,dimensions,normalization,input_contract_version,created_at_ms,config_fingerprint) VALUES(?1,'ollama','m',?1,8,'l2','v1',0,?1)",[id]).unwrap();
+        }
+        let bytes = vec![0_u8; 32];
+        connection.execute("INSERT INTO embedding_vectors(embedding_space_id,text_hash,vector_bytes,dimensions,created_at_ms) VALUES('es_a','blake3:x',?1,8,0)",[&bytes]).unwrap();
+        assert!(connection.execute("INSERT INTO embedding_vectors(embedding_space_id,text_hash,vector_bytes,dimensions,created_at_ms) VALUES('es_a','blake3:x',?1,8,0)",[&bytes]).is_err());
+        connection.execute("INSERT INTO embedding_vectors(embedding_space_id,text_hash,vector_bytes,dimensions,created_at_ms) VALUES('es_b','blake3:x',?1,8,0)",[&bytes]).unwrap();
+        assert!(connection.execute("INSERT INTO embedding_vectors(embedding_space_id,text_hash,vector_bytes,dimensions,created_at_ms) VALUES('es_a','blake3:y',x'00',8,0)",[]).is_err());
+    }
+
     #[test]
     fn future_schema_is_rejected() {
         let mut connection = Connection::open_in_memory().unwrap();
@@ -986,5 +1165,37 @@ mod tests {
         let path = temp.path().join("index.sqlite3");
         open_database(&path).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn configured_active_space_compatibility_is_explicit_without_network() {
+        let mut config = crate::config::EmbeddingConfig::default();
+        let empty = EmbeddingStatus::default();
+        assert_eq!(embedding_compatibility(&config, &empty).state, "disabled");
+        config.enabled = true;
+        config.provider = crate::config::EmbeddingProviderConfig::Ollama;
+        config.endpoint = "http://localhost:11434".into();
+        config.model = "fixture".into();
+        config.dimensions = 8;
+        assert_eq!(
+            embedding_compatibility(&config, &empty).state,
+            "missing_active_space"
+        );
+        let active = EmbeddingStatus {
+            space_exists: true,
+            provider: Some("ollama".into()),
+            canonical_model: Some("fixture:latest".into()),
+            dimensions: Some(8),
+            ..EmbeddingStatus::default()
+        };
+        assert_eq!(
+            embedding_compatibility(&config, &active).state,
+            "compatible_requires_digest_resolution"
+        );
+        config.dimensions = 16;
+        assert_eq!(
+            embedding_compatibility(&config, &active).state,
+            "incompatible"
+        );
     }
 }

@@ -11,6 +11,7 @@
 configuration + approved roots
     → discovery/parse/index (immutable revisions, active FTS)
          ↳ optional Git changed-path selection (same path policy as discovery)
+         ↳ optional post-commit embedding sync (digest-isolated space + text-hash cache)
     → lexical query (safe MATCH) on local active FTS
     → optional snapshot federation (read-only payloads, RRF)
     → BM25 / federation ranking + filters
@@ -29,6 +30,14 @@ When imported snapshots are eligible, lists are fused with Reciprocal Rank Fusio
 ## Snapshots
 
 Directory format v1 (`MANIFEST.json` + `payload.sqlite3`). Import is compensating-atomic. Lifecycle: list / inspect / remove. Queryability requires complete explicit root maps. See ADR-0015, ADR-0016, ADR-0017.
+
+Format v1 remains lexical-only: local embedding spaces, vectors, references, failures, and sync runs are never exported.
+
+## Embedding materialization
+
+The synchronous `EmbeddingProvider` boundary contains no Ollama transport types. Lexical indexing commits first; enabled synchronization then resolves an exact model digest, derives a deterministic compatibility-space ID, links cache hits, and calls the provider outside SQLite transactions. Cache persistence and segment linking are transactional per successful batch. Provider failure cannot roll back a lexical revision. Semantic querying is deferred to Milestone 4B.
+
+Persisted cache hits are loaded, dimension-checked, decoded, and verified as already L2-normalized before linkage. Fresh provider batches are count/dimension/value validated and normalized in memory before any database mutation. Malformed batches become bounded partial failures rather than storage failures.
 
 ## Token estimation
 

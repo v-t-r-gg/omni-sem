@@ -7,20 +7,24 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["embeddings-ollama"]
+embeddings-ollama = ["omnisem-core/embeddings-ollama"]
+
 [[bin]]
 name = "omnisem"
 path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-omnisem-core = { path = "../omnisem-core" }
+omnisem-core = { path = "../omnisem-core", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-omnisem-core = { path = "../omnisem-core" }
+omnisem-core = { path = "../omnisem-core", default-features = false }
 
 [lints]
 workspace = true

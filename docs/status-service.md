@@ -1,5 +1,9 @@
 # Local status HTTP service
 
+Embedding projections come only from persisted schema v4 state: safe space/model metadata, dimensions, coverage, failures, and latest sync. The service never contacts Ollama and never exposes endpoint URLs, vectors, source/query text, or provider bodies.
+
+The server receives the already-validated embedding configuration and reports network-free configured-versus-active compatibility. Mutable-tag digest verification remains the explicit responsibility of `doctor`.
+
 ## Bind
 
 `omnisem status --serve [--port N]` listens on `127.0.0.1` only. Port `0` is ephemeral.

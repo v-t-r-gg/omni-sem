@@ -45,6 +45,7 @@ pub struct IndexReport {
     pub failures: u32,
     pub segments_indexed: u32,
     pub duration_ms: u64,
+    pub embedding: Option<crate::embedding_sync::EmbeddingSyncReport>,
     pub root_reports: Vec<RootIndexReport>,
 }
 
@@ -137,6 +138,7 @@ pub fn index_roots_with_options(
         failures: 0,
         segments_indexed: 0,
         duration_ms: 0,
+        embedding: None,
         root_reports: Vec::new(),
     };
 
@@ -182,6 +184,10 @@ pub fn index_roots_with_options(
         report.root_reports.push(root_report);
     }
 
+    report.embedding = Some(crate::embedding_sync::synchronize_embeddings(
+        connection,
+        &config.embeddings,
+    )?);
     report.duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     Ok(report)
 }

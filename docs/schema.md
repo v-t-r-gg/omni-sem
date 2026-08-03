@@ -7,12 +7,15 @@
 | 1 | `0001_initial.sql` | foundation tables |
 | 2 | `0002_operational_indexing.sql` | timestamps, sensitivity, scan runs, FTS5 |
 | 3 | `0003_m3_incremental_snapshots.sql` | root Git state, snapshots, maps, query activity |
+| 4 | `0004_embedding_foundation.sql` | spaces, vector cache, segment links, failures, sync history |
 
-Current executable schema version: **3**.
+Current executable schema version: **4**.
 
 Migration `0001` is never rewritten. Later migrations are additive. Future schema versions are rejected. Snapshot **format** version is independent (format v1).
 
 Failed migrations are not marked complete. Foreign keys are enabled at the connection boundary.
+
+Embedding spaces are unique across provider, canonical model, digest, dimensions, normalization, and input-contract version. Cache identity is `(embedding_space_id, text_hash)`; vector length must equal `dimensions * 4`. Segment links require that exact cache key through a composite foreign key. Failure messages are bounded. Fresh and v1/v2/v3 databases migrate transactionally to v4.
 
 ## Tables
 
