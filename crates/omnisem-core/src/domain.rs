@@ -517,6 +517,15 @@ pub enum RetrievalMode {
     Auto,
 }
 
+/// Caller class used to enforce audience-specific evidence visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalAudience {
+    /// Interactive local CLI caller; preserves the existing explicit-sensitive opt-in.
+    LocalUser,
+    /// Read-only MCP caller; all sensitivity-tagged evidence is categorically excluded.
+    Mcp,
+}
+
 impl RetrievalMode {
     /// Returns the stable storage/output token.
     #[must_use]

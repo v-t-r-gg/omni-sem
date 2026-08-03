@@ -12,6 +12,7 @@ pub mod git;
 pub mod hash;
 pub mod index;
 pub mod io;
+pub mod mcp;
 pub mod parsing;
 pub mod paths;
 pub mod query_parse;

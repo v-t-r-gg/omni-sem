@@ -16,6 +16,19 @@ use crate::paths::restrict_permissions;
 /// Current schema version understood by this executable.
 pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
+/// Opens an existing Omni-Sem database without migration or write capability.
+///
+/// # Errors
+/// Returns a storage error when the database cannot be opened read-only.
+pub fn open_database_readonly(path: &Path) -> Result<Connection, StorageError> {
+    let uri = format!("file:{}?mode=ro", path.display());
+    Connection::open_with_flags(
+        &uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(StorageError::from)
+}
+
 const MIGRATION_1: &str = include_str!("../../../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../../../migrations/0002_operational_indexing.sql");
 const MIGRATION_3: &str = include_str!("../../../migrations/0003_m3_incremental_snapshots.sql");
