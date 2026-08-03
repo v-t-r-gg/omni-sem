@@ -3,6 +3,7 @@
 pub mod config;
 pub mod discovery;
 pub mod domain;
+pub mod embedding;
 pub mod error;
 pub mod eval;
 pub mod freshness;

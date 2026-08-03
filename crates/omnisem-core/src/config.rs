@@ -17,9 +17,70 @@ use crate::paths::{AppPaths, expand_user_path, restrict_permissions};
 pub struct AppConfig {
     pub general: GeneralConfig,
     #[serde(default)]
+    pub embeddings: EmbeddingConfig,
+    #[serde(default)]
     pub retrieval: RetrievalConfig,
     #[serde(default)]
     pub roots: Vec<RootConfig>,
+}
+
+/// Explicit embedding provider configuration. The default is network inert.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub provider: EmbeddingProviderConfig,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default = "default_embedding_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_embedding_timeout")]
+    pub request_timeout_seconds: u64,
+    #[serde(default = "default_keep_alive")]
+    pub keep_alive: String,
+    #[serde(default)]
+    pub truncate: bool,
+    #[serde(default)]
+    pub dimensions: u32,
+}
+
+/// Providers that may be selected in production configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbeddingProviderConfig {
+    #[default]
+    None,
+    Ollama,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: EmbeddingProviderConfig::None,
+            endpoint: String::new(),
+            model: String::new(),
+            batch_size: default_embedding_batch_size(),
+            request_timeout_seconds: default_embedding_timeout(),
+            keep_alive: default_keep_alive(),
+            truncate: false,
+            dimensions: 0,
+        }
+    }
+}
+
+const fn default_embedding_batch_size() -> usize {
+    16
+}
+const fn default_embedding_timeout() -> u64 {
+    60
+}
+fn default_keep_alive() -> String {
+    "5m".into()
 }
 
 /// Retrieval defaults and named budget presets.
@@ -134,6 +195,7 @@ impl AppConfig {
                 database_path: paths.default_database_path.display().to_string(),
                 log_level: default_log_level(),
             },
+            embeddings: EmbeddingConfig::default(),
             retrieval: RetrievalConfig::default(),
             roots: Vec::new(),
         }
@@ -219,6 +281,7 @@ impl AppConfig {
     ///
     /// Returns duplicate name/path or identifier errors.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.embeddings.validate()?;
         if self.retrieval.default_limit == 0 || self.retrieval.default_token_budget == 0 {
             return Err(ConfigError::Invalid {
                 path: PathBuf::from("config"),
@@ -304,6 +367,67 @@ impl AppConfig {
     #[must_use]
     pub fn find_root(&self, root_id: &str) -> Option<&RootConfig> {
         self.roots.iter().find(|root| root.id == root_id)
+    }
+}
+
+impl EmbeddingConfig {
+    /// Validates the explicit network and compatibility contract.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |message: &str| ConfigError::Invalid {
+            path: PathBuf::from("config.embeddings"),
+            message: message.into(),
+        };
+        if self.batch_size == 0 || self.batch_size > 256 {
+            return Err(invalid("batch_size must be between 1 and 256"));
+        }
+        if self.request_timeout_seconds == 0 || self.request_timeout_seconds > 600 {
+            return Err(invalid("request_timeout_seconds must be between 1 and 600"));
+        }
+        if self.truncate {
+            return Err(invalid(
+                "truncate must remain false; source segments are never silently truncated",
+            ));
+        }
+        if self.dimensions != 0 && !(8..=65_536).contains(&self.dimensions) {
+            return Err(invalid("dimensions must be zero or between 8 and 65536"));
+        }
+        if !self.enabled {
+            if self.provider != EmbeddingProviderConfig::None
+                || !self.endpoint.is_empty()
+                || !self.model.is_empty()
+                || self.dimensions != 0
+            {
+                return Err(invalid(
+                    "disabled embeddings require provider 'none' and empty endpoint/model with dimensions 0",
+                ));
+            }
+            return Ok(());
+        }
+        if self.provider == EmbeddingProviderConfig::None {
+            return Err(invalid("enabled embeddings require an explicit provider"));
+        }
+        if self.model.trim().is_empty() {
+            return Err(invalid("Ollama model must not be empty"));
+        }
+        if self.endpoint.trim().is_empty() {
+            return Err(invalid("Ollama endpoint must not be empty"));
+        }
+        let endpoint = url::Url::parse(&self.endpoint)
+            .map_err(|_| invalid("Ollama endpoint is not a valid URL"))?;
+        if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
+            return Err(invalid(
+                "Ollama endpoint must use HTTP or HTTPS and include a host",
+            ));
+        }
+        if !endpoint.username().is_empty() || endpoint.password().is_some() {
+            return Err(invalid("Ollama endpoint must not contain credentials"));
+        }
+        if endpoint.query().is_some() || endpoint.fragment().is_some() {
+            return Err(invalid(
+                "Ollama endpoint must not contain a query or fragment",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -535,5 +659,34 @@ mystery = true
         add_root(&mut config, &root_dir, Some("notes".into())).unwrap();
         let error = add_root(&mut config, &root_dir, Some("other".into())).unwrap_err();
         assert!(matches!(error, ConfigError::DuplicateRootPath(_)));
+    }
+
+    #[test]
+    fn embedding_defaults_are_network_inert() {
+        let config = AppConfig::default_for(&AppPaths::for_base(Path::new("/tmp/test")));
+        assert!(!config.embeddings.enabled);
+        assert_eq!(config.embeddings.provider, EmbeddingProviderConfig::None);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn embedding_validation_rejects_ambiguous_and_unsafe_values() {
+        let mut value = EmbeddingConfig::default();
+        value.enabled = true;
+        assert!(value.validate().is_err());
+        value.provider = EmbeddingProviderConfig::Ollama;
+        value.model = "nomic-embed-text".into();
+        value.endpoint = "ftp://localhost:11434".into();
+        assert!(value.validate().is_err());
+        value.endpoint = "http://user:secret@localhost:11434".into();
+        assert!(value.validate().is_err());
+        value.endpoint = "http://localhost:11434".into();
+        value.batch_size = 0;
+        assert!(value.validate().is_err());
+        value.batch_size = 16;
+        value.dimensions = 7;
+        assert!(value.validate().is_err());
+        value.dimensions = 768;
+        value.validate().unwrap();
     }
 }
