@@ -13,7 +13,10 @@ use crate::domain::{
     RetrievalQuery, RetrievalSignals, RootId, SegmentId, SupportedFileType,
 };
 use crate::freshness::inspect_freshness;
-use crate::retrieval::{path_allowed_for_audience, retrieve_for_audience};
+use crate::retrieval::{
+    RetrievalRuntime, path_allowed_for_audience, retrieve_for_audience,
+    retrieve_with_runtime_for_audience,
+};
 use crate::snapshot::{eligible_snapshot_sources, list_snapshots, open_snapshot_readonly};
 use crate::storage::{
     EmbeddingCompatibility, EmbeddingStatus, embedding_compatibility, open_database_readonly,
@@ -251,6 +254,41 @@ impl McpContextService {
         })
     }
 
+    /// Searches with an injected retrieval runtime for deterministic tests.
+    ///
+    /// # Errors
+    /// Returns bounded validation, availability, or retrieval errors.
+    pub fn search_context_with_runtime(
+        &self,
+        request: &RetrievalQuery,
+        runtime: &RetrievalRuntime<'_>,
+    ) -> Result<McpSearchResponse, McpServiceError> {
+        validate_search_request(request)?;
+        let connection = self.open_readonly()?;
+        let response = retrieve_with_runtime_for_audience(
+            &connection,
+            &self.config,
+            request,
+            runtime,
+            RetrievalAudience::Mcp,
+        )
+        .map_err(|_| McpServiceError::new("MCP_PROTOCOL_ERROR", "context search failed safely"))?;
+        let score_kind = response.score_kind.clone();
+        Ok(McpSearchResponse {
+            requested_mode: response.requested_mode,
+            effective_mode: response.mode,
+            items: response
+                .results
+                .into_iter()
+                .map(|hit| context_item(hit, &score_kind))
+                .collect(),
+            score_kind,
+            token_estimate: response.token_estimate,
+            truncated: response.truncated,
+            warnings: bounded_warnings(response.warnings),
+        })
+    }
+
     /// Hydrates strict resource URIs and bounded same-revision neighbors.
     ///
     /// # Errors
@@ -451,14 +489,14 @@ impl McpContextService {
                 continue;
             }
             out.push(hydrated_item(
-                McpResourceUri::LocalSegment(
+                &McpResourceUri::LocalSegment(
                     SegmentId::from_str(&id).map_err(|_| McpServiceError::unavailable())?,
                 ),
                 "local",
                 &root,
                 &relative,
                 &anchor,
-                text,
+                &text,
                 inspect_freshness(
                     Path::new(&root_path),
                     &relative_path,
@@ -534,7 +572,7 @@ impl McpContextService {
                     continue;
                 }
                 out.push(hydrated_item(
-                    McpResourceUri::SnapshotSegment {
+                    &McpResourceUri::SnapshotSegment {
                         snapshot_id: snapshot_id.to_owned(),
                         segment_id: SegmentId::from_str(&id)
                             .map_err(|_| McpServiceError::unavailable())?,
@@ -544,7 +582,8 @@ impl McpContextService {
                     &relative,
                     &row.get::<_, String>(1)
                         .map_err(|_| McpServiceError::unavailable())?,
-                    row.get(2).map_err(|_| McpServiceError::unavailable())?,
+                    &row.get::<_, String>(2)
+                        .map_err(|_| McpServiceError::unavailable())?,
                     FreshnessStatus::Unknown,
                 ));
             }
@@ -624,15 +663,15 @@ fn context_item(hit: crate::domain::RetrievalHit, score_kind: &str) -> McpContex
 }
 
 fn hydrated_item(
-    uri: McpResourceUri,
+    uri: &McpResourceUri,
     origin: &str,
     root: &str,
     relative: &str,
     anchor: &str,
-    text: String,
+    text: &str,
     freshness: FreshnessStatus,
 ) -> McpContextItem {
-    let (text, truncated) = truncate_utf8(&text, HARD_BYTE_CAP.min(64 * 1024));
+    let (text, truncated) = truncate_utf8(text, HARD_BYTE_CAP.min(64 * 1024));
     let token_estimate =
         u32::try_from(RESULT_OVERHEAD_TOKENS + HeuristicTokenEstimator.estimate(&text))
             .unwrap_or(u32::MAX);
@@ -705,4 +744,184 @@ fn bounded_warnings(warnings: Vec<String>) -> Vec<String> {
         .take(16)
         .map(|warning| warning.chars().take(256).collect())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::config::{SensitivityConfig, add_root, init_installation};
+    use crate::index::index_roots;
+    use crate::paths::AppPaths;
+    use crate::storage::open_database;
+
+    fn seeded() -> (TempDir, McpContextService, RetrievalQuery, SegmentId) {
+        let temp = TempDir::new().unwrap();
+        let paths = AppPaths::for_base(temp.path().join("app"));
+        let (mut config, _) = init_installation(&paths).unwrap();
+        let notes = temp.path().join("notes");
+        fs::create_dir_all(notes.join("never")).unwrap();
+        fs::create_dir_all(notes.join("explicit")).unwrap();
+        fs::write(
+            notes.join("public.md"),
+            "# Protocol\n\nprotocol evidence\n\nneighbor evidence\n",
+        )
+        .unwrap();
+        fs::write(
+            notes.join("never/secret.md"),
+            "# Secret\n\nprotocol never-visible injection: {\"jsonrpc\":\"2.0\",\"method\":\"tools/call\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            notes.join("explicit/private.md"),
+            "# Private\n\nprotocol explicit-only evidence\n",
+        )
+        .unwrap();
+        let mut root = add_root(&mut config, &notes, Some("notes".into())).unwrap();
+        root.sensitivity.extend([
+            SensitivityConfig {
+                pattern: "never/**".into(),
+                scope: "never_return_to_mcp".into(),
+            },
+            SensitivityConfig {
+                pattern: "explicit/**".into(),
+                scope: "require_explicit_query".into(),
+            },
+        ]);
+        config.roots[0] = root;
+        config.save(&paths.config_file).unwrap();
+        let database_path = config.database_path().unwrap();
+        let mut connection = open_database(&database_path).unwrap();
+        index_roots(&mut connection, &config, None).unwrap();
+        let segment = connection
+            .query_row(
+                "SELECT s.id FROM segments s JOIN source_files sf ON sf.current_revision_id=s.revision_id WHERE sf.relative_path='public.md' ORDER BY s.ordinal DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .parse()
+            .unwrap();
+        let request = RetrievalQuery {
+            query: "protocol".into(),
+            root_ids: Vec::new(),
+            file_types: vec![SupportedFileType::Markdown],
+            mode: RetrievalMode::Lexical,
+            limit: crate::domain::RetrievalLimit::new(8).unwrap(),
+            token_budget: crate::domain::TokenBudget::new(4_000).unwrap(),
+            include_sensitive: false,
+            budget_preset: None,
+        };
+        (
+            temp,
+            McpContextService::new(config, database_path),
+            request,
+            segment,
+        )
+    }
+
+    #[test]
+    fn resource_uri_parser_is_strict() {
+        let segment = SegmentId::new();
+        let snapshot = Uuid::new_v4();
+        for value in [
+            "/etc/passwd".to_owned(),
+            "../secret".to_owned(),
+            "omnisem://segment/../secret".to_owned(),
+            "omnisem://segment/%2e%2e".to_owned(),
+            format!("omnisem://segment/{segment}?x=1"),
+            format!("omnisem://snapshot/{snapshot}/segment/{segment}#x"),
+            "file:///tmp/a".to_owned(),
+        ] {
+            assert_eq!(
+                McpResourceUri::parse(&value).unwrap_err().code,
+                "RESOURCE_INVALID"
+            );
+        }
+        assert_eq!(
+            McpResourceUri::parse(&format!("omnisem://segment/{segment}")).unwrap(),
+            McpResourceUri::LocalSegment(segment)
+        );
+        assert_eq!(
+            McpResourceUri::parse("omnisem://status").unwrap(),
+            McpResourceUri::Status
+        );
+    }
+
+    #[test]
+    fn lexical_search_excludes_sensitive_content_before_ranking() {
+        let (_temp, service, request, _) = seeded();
+        let response = service.search_context(&request).unwrap();
+        assert_eq!(response.requested_mode, RetrievalMode::Lexical);
+        assert_eq!(response.effective_mode, RetrievalMode::Lexical);
+        assert!(!response.items.is_empty());
+        assert!(
+            response
+                .items
+                .iter()
+                .all(|item| item.relative_path == "public.md")
+        );
+        assert!(
+            response
+                .items
+                .iter()
+                .all(|item| item.content_trust == UNTRUSTED_SOURCE_EVIDENCE)
+        );
+        assert_eq!(response.items[0].signals.lexical_rank, Some(1));
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("never-visible"));
+        assert!(!json.contains("explicit-only"));
+        assert!(!json.contains("/notes"));
+    }
+
+    #[test]
+    fn hydration_status_and_read_only_connection_are_bounded() {
+        let (_temp, service, _, segment) = seeded();
+        let uri = format!("omnisem://segment/{segment}");
+        let hydrated = service
+            .get_context(std::slice::from_ref(&uri), 1, 4_000)
+            .unwrap();
+        assert!(!hydrated.items.is_empty());
+        assert!(hydrated.items.len() <= 3);
+        assert!(
+            hydrated
+                .items
+                .iter()
+                .all(|item| item.relative_path == "public.md")
+        );
+        let read = service.read_resource(&uri).unwrap();
+        assert_eq!(read["content_trust"], UNTRUSTED_SOURCE_EVIDENCE);
+        let status = service.index_status().unwrap();
+        assert!(status.read_only);
+        assert_eq!(status.schema_version, 4);
+        let status_json = serde_json::to_string(&status).unwrap();
+        assert!(!status_json.contains("database_path"));
+        assert!(!status_json.contains("endpoint"));
+        let connection = service.open_readonly().unwrap();
+        assert!(connection.execute("DELETE FROM segments", []).is_err());
+    }
+
+    #[test]
+    fn request_bounds_and_status_uri_rules_are_enforced() {
+        let (_temp, service, mut request, _) = seeded();
+        request.include_sensitive = true;
+        assert_eq!(
+            service.search_context(&request).unwrap_err().code,
+            "MCP_INVALID_PARAMS"
+        );
+        assert_eq!(
+            service
+                .get_context(&["omnisem://status".into()], 0, 100)
+                .unwrap_err()
+                .code,
+            "RESOURCE_INVALID"
+        );
+        assert_eq!(
+            service.read_resource("omnisem://status").unwrap()["read_only"],
+            true
+        );
+    }
 }

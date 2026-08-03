@@ -48,6 +48,7 @@ pub trait VectorSearch: Send + Sync {
     ///
     /// # Errors
     /// Returns a typed retrieval failure for storage corruption or safety-bound violations.
+    #[allow(clippy::too_many_arguments)]
     fn search(
         &self,
         connection: &Connection,
@@ -126,11 +127,16 @@ impl VectorSearch for SqliteExactVectorSearch {
         audience: RetrievalAudience,
         limit: usize,
     ) -> Result<VectorSearchReport, RetrievalError> {
-        let eligible: u64 = connection.query_row(
-            "SELECT count(*) FROM segment_embeddings se JOIN segments s ON s.id=se.segment_id JOIN source_files sf ON sf.current_revision_id=s.revision_id AND sf.state='active' JOIN roots r ON r.id=sf.root_id AND r.enabled=1 WHERE se.embedding_space_id=?1",
-            [&space.id], |row| row.get(0)).map_err(StorageError::from)?;
-        // The safety bound is deliberately conservative and applies to the complete
-        // compatible active space before request filters.
+        let eligible: u64 = if audience == RetrievalAudience::LocalUser {
+            connection.query_row(
+                "SELECT count(*) FROM segment_embeddings se JOIN segments s ON s.id=se.segment_id JOIN source_files sf ON sf.current_revision_id=s.revision_id AND sf.state='active' JOIN roots r ON r.id=sf.root_id AND r.enabled=1 WHERE se.embedding_space_id=?1",
+                [&space.id], |row| row.get(0)).map_err(StorageError::from)?
+        } else {
+            0
+        };
+        // Local-user retrieval preserves the complete-space pre-filter bound.
+        // MCP counts only audience-eligible candidates so forbidden evidence cannot
+        // influence its limits or telemetry.
         if eligible > self.max_active_vectors as u64 {
             return Err(semantic_error(
                 "VECTOR_SCAN_LIMIT_EXCEEDED",
@@ -162,6 +168,14 @@ impl VectorSearch for SqliteExactVectorSearch {
                 continue;
             }
             examined = examined.saturating_add(1);
+            if audience == RetrievalAudience::Mcp
+                && examined > u32::try_from(self.max_active_vectors).unwrap_or(u32::MAX)
+            {
+                return Err(semantic_error(
+                    "VECTOR_SCAN_LIMIT_EXCEEDED",
+                    "eligible active-vector count exceeds the exact-scan safety bound",
+                ));
+            }
             let dimensions = row.get::<_, u32>(12).map_err(StorageError::from)?;
             let bytes = row.get::<_, Vec<u8>>(11).map_err(StorageError::from)?;
             if dimensions != space.dimensions {
@@ -424,7 +438,7 @@ pub fn retrieve_with_runtime_for_audience(
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn retrieve_lexical(
     connection: &Connection,
     config: &AppConfig,
@@ -446,7 +460,15 @@ fn retrieve_lexical(
 
     let candidate_limit =
         (usize::from(request.limit.get()) * CANDIDATE_MULTIPLIER).clamp(1, MAX_CANDIDATES);
-    let mut candidates = search_fts(connection, request, &parsed, candidate_limit)?;
+    let sensitivity = load_sensitivity_sets(config);
+    let mut candidates = search_fts(
+        connection,
+        request,
+        &parsed,
+        candidate_limit,
+        &sensitivity,
+        audience,
+    )?;
     let mut warnings = std::mem::take(&mut initial_warnings);
 
     let before_dedupe = candidates.len();
@@ -454,7 +476,6 @@ fn retrieve_lexical(
     let duplicates_suppressed =
         u32::try_from(before_dedupe.saturating_sub(candidates.len())).unwrap_or(u32::MAX);
 
-    let sensitivity = load_sensitivity_sets(config);
     candidates = filter_sensitivity(
         candidates,
         &sensitivity,
@@ -838,6 +859,8 @@ fn search_fts(
     request: &RetrievalQuery,
     parsed: &ParsedQuery,
     limit: usize,
+    sensitivity: &SensitivityIndex,
+    audience: RetrievalAudience,
 ) -> Result<Vec<RawCandidate>, RetrievalError> {
     let mut sql = String::from(
         "SELECT
@@ -889,16 +912,19 @@ fn search_fts(
             bind.push(file_type.as_str().to_owned());
         }
     }
-    sql.push_str(
-        " ORDER BY rank ASC, fts.relative_path ASC, fts.anchor ASC, fts.segment_id ASC LIMIT ?",
-    );
+    sql.push_str(" ORDER BY rank ASC, fts.relative_path ASC, fts.anchor ASC, fts.segment_id ASC");
+    if audience == RetrievalAudience::LocalUser {
+        sql.push_str(" LIMIT ?");
+    }
 
     let mut statement = connection.prepare(&sql).map_err(StorageError::from)?;
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = bind
         .into_iter()
         .map(|value| Box::new(value) as Box<dyn rusqlite::types::ToSql>)
         .collect();
-    params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+    if audience == RetrievalAudience::LocalUser {
+        params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+    }
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(AsRef::as_ref).collect();
     let mut rows = statement
@@ -918,6 +944,16 @@ fn search_fts(
             row.get(idx)
                 .map_err(|error| RetrievalError::Storage(StorageError::from(error)))
         };
+        let root_id = RootId::from_str(&get_string(3)?)
+            .map_err(|error| RetrievalError::Internal(error.to_string()))?;
+        let relative_path = PathBuf::from(get_string(4)?);
+        if !sensitivity_allowed(
+            sensitivity_for_path(sensitivity, &root_id, &relative_path),
+            audience,
+            request.include_sensitive,
+        ) {
+            continue;
+        }
         out.push(RawCandidate {
             segment_id: SegmentId::from_str(&get_string(0)?)
                 .map_err(|error| RetrievalError::Internal(error.to_string()))?,
@@ -925,9 +961,8 @@ fn search_fts(
                 .map_err(|error| RetrievalError::Internal(error.to_string()))?,
             source_file_id: SourceFileId::from_str(&get_string(2)?)
                 .map_err(|error| RetrievalError::Internal(error.to_string()))?,
-            root_id: RootId::from_str(&get_string(3)?)
-                .map_err(|error| RetrievalError::Internal(error.to_string()))?,
-            relative_path: PathBuf::from(get_string(4)?),
+            root_id,
+            relative_path,
             anchor: get_string(5)?,
             text: get_string(6)?,
             text_hash: ContentHash(get_string(7)?),
@@ -943,6 +978,9 @@ fn search_fts(
             },
             highlighted: get_string(12)?,
         });
+        if out.len() == limit {
+            break;
+        }
     }
     Ok(out)
 }
@@ -1284,15 +1322,18 @@ fn search_snapshot_hits(
             bind.push(ft.as_str().to_owned());
         }
     }
-    sql.push_str(
-        " ORDER BY rank ASC, fts.relative_path ASC, fts.anchor ASC, fts.segment_id ASC LIMIT ?",
-    );
+    sql.push_str(" ORDER BY rank ASC, fts.relative_path ASC, fts.anchor ASC, fts.segment_id ASC");
+    if audience == RetrievalAudience::LocalUser {
+        sql.push_str(" LIMIT ?");
+    }
     let mut statement = snap.prepare(&sql).map_err(|e| e.to_string())?;
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = bind
         .into_iter()
         .map(|v| Box::new(v) as Box<dyn rusqlite::types::ToSql>)
         .collect();
-    params.push(Box::new(i64::try_from(SNAPSHOT_CANDIDATES).unwrap_or(32)));
+    if audience == RetrievalAudience::LocalUser {
+        params.push(Box::new(i64::try_from(SNAPSHOT_CANDIDATES).unwrap_or(32)));
+    }
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(AsRef::as_ref).collect();
     let mut rows = statement
         .query(param_refs.as_slice())
@@ -1367,6 +1408,9 @@ fn search_snapshot_hits(
                 snapshot_root_id: source.snapshot_root_id.clone(),
             },
         });
+        if hits.len() == SNAPSHOT_CANDIDATES {
+            break;
+        }
     }
     for (rank, hit) in hits.iter_mut().enumerate() {
         hit.signals.lexical_rank = Some(u32::try_from(rank + 1).unwrap_or(u32::MAX));
@@ -1728,6 +1772,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(query_rows, 0);
+    }
+
+    #[test]
+    fn mcp_audience_excludes_sensitive_semantic_hybrid_and_auto_candidates() {
+        let (_temp, config, connection, fake) = semantic_seeded();
+        let scanner = SqliteExactVectorSearch::default();
+        for mode in [
+            RetrievalMode::Semantic,
+            RetrievalMode::Hybrid,
+            RetrievalMode::Auto,
+        ] {
+            let request = RetrievalQuery {
+                query: "SQLite durable database".into(),
+                root_ids: Vec::new(),
+                file_types: Vec::new(),
+                mode,
+                limit: RetrievalLimit::new(10).unwrap(),
+                token_budget: TokenBudget::new(4_000).unwrap(),
+                // An internal caller cannot use this flag to override MCP policy.
+                include_sensitive: true,
+                budget_preset: None,
+            };
+            let response = retrieve_with_runtime_for_audience(
+                &connection,
+                &config,
+                &request,
+                &RetrievalRuntime {
+                    embedding_provider: Some(&fake),
+                    vector_search: &scanner,
+                },
+                RetrievalAudience::Mcp,
+            )
+            .unwrap();
+            assert!(
+                response
+                    .results
+                    .iter()
+                    .all(|hit| !hit.relative_path.starts_with("private"))
+            );
+            assert!(
+                response
+                    .results
+                    .iter()
+                    .all(|hit| hit.sensitivity_scope.is_none())
+            );
+        }
     }
 
     #[test]
