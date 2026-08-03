@@ -14,11 +14,12 @@ use crate::hash::blake3_hex;
 use crate::paths::restrict_permissions;
 
 /// Current schema version understood by this executable.
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_1: &str = include_str!("../../../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../../../migrations/0002_operational_indexing.sql");
 const MIGRATION_3: &str = include_str!("../../../migrations/0003_m3_incremental_snapshots.sql");
+const MIGRATION_4: &str = include_str!("../../../migrations/0004_embedding_foundation.sql");
 
 /// Applies every pending migration transactionally.
 ///
@@ -45,6 +46,9 @@ pub fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
     }
     if schema_version(connection)?.unwrap_or(0) < 3 {
         apply(connection.transaction()?, 3, MIGRATION_3)?;
+    }
+    if schema_version(connection)?.unwrap_or(0) < 4 {
+        apply(connection.transaction()?, 4, MIGRATION_4)?;
     }
     Ok(())
 }
@@ -726,6 +730,25 @@ pub struct StatusSnapshot {
     pub last_successful_scan_ms: Option<i64>,
     pub last_failed_scan_ms: Option<i64>,
     pub database_size_bytes: u64,
+    pub embedding: EmbeddingStatus,
+}
+
+/// Persisted-only embedding health projection. Reading it never contacts a provider.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
+pub struct EmbeddingStatus {
+    pub space_exists: bool,
+    pub active_space_id: Option<String>,
+    pub provider: Option<String>,
+    pub canonical_model: Option<String>,
+    pub model_digest: Option<String>,
+    pub dimensions: Option<u32>,
+    pub normalization: Option<String>,
+    pub active_segments: i64,
+    pub linked_active_segments: i64,
+    pub missing_active_segments: i64,
+    pub current_failure_count: i64,
+    pub latest_sync_status: Option<String>,
+    pub latest_sync_completed_at_ms: Option<i64>,
 }
 
 /// Collects operational status counters.
@@ -796,6 +819,47 @@ pub fn status_snapshot(
         )
         .optional()?;
     let database_size_bytes = std::fs::metadata(database_path).map_or(0, |meta| meta.len());
+    let active_space_id: Option<String> = connection
+        .query_row(
+            "SELECT active_embedding_space_id FROM embedding_state WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let space_fields = active_space_id.as_ref().and_then(|id| connection.query_row("SELECT provider,canonical_model,model_digest,dimensions,normalization FROM embedding_spaces WHERE id=?1", [id], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,u32>(3)?,row.get::<_,String>(4)?))).optional().ok().flatten());
+    let linked_active_segments = if let Some(id) = &active_space_id {
+        connection.query_row("SELECT COUNT(*) FROM segment_embeddings e JOIN source_files f ON f.current_revision_id=e.revision_id WHERE f.state='active' AND e.embedding_space_id=?1",[id],|row|row.get(0))?
+    } else {
+        0
+    };
+    let current_failure_count = if let Some(id) = &active_space_id {
+        connection.query_row("SELECT COUNT(*) FROM embedding_failures ef JOIN segments s ON s.id=ef.segment_id JOIN source_files f ON f.current_revision_id=s.revision_id WHERE f.state='active' AND ef.embedding_space_id=?1",[id],|row|row.get(0))?
+    } else {
+        0
+    };
+    let latest_sync: Option<(String, Option<i64>)> = connection
+        .query_row(
+            "SELECT status,completed_at_ms FROM embedding_sync_runs ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let embedding = EmbeddingStatus {
+        space_exists: active_space_id.is_some(),
+        active_space_id,
+        provider: space_fields.as_ref().map(|v| v.0.clone()),
+        canonical_model: space_fields.as_ref().map(|v| v.1.clone()),
+        model_digest: space_fields.as_ref().map(|v| v.2.clone()),
+        dimensions: space_fields.as_ref().map(|v| v.3),
+        normalization: space_fields.as_ref().map(|v| v.4.clone()),
+        active_segments,
+        linked_active_segments,
+        missing_active_segments: active_segments.saturating_sub(linked_active_segments),
+        current_failure_count,
+        latest_sync_status: latest_sync.as_ref().map(|v| v.0.clone()),
+        latest_sync_completed_at_ms: latest_sync.and_then(|v| v.1),
+    };
     Ok(StatusSnapshot {
         schema_version,
         root_count,
@@ -809,6 +873,7 @@ pub fn status_snapshot(
         last_successful_scan_ms,
         last_failed_scan_ms,
         database_size_bytes,
+        embedding,
     })
 }
 
