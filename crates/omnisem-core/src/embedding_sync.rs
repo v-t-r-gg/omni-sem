@@ -204,9 +204,8 @@ pub fn synchronize_with_provider(
     for (chunk_index, chunk) in chunks.iter().enumerate() {
         let inputs = chunk
             .iter()
-            .map(|(hash, refs)| EmbeddingInput {
-                text_hash: ContentHash(hash.clone()),
-                text: refs[0].text.clone(),
+            .map(|(hash, refs)| {
+                EmbeddingInput::segment(ContentHash(hash.clone()), refs[0].text.clone())
             })
             .collect::<Vec<_>>();
         provider_inputs += inputs.len() as u32;

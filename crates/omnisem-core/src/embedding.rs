@@ -116,6 +116,33 @@ impl EmbeddingSpace {
 pub struct EmbeddingInput {
     pub text_hash: ContentHash,
     pub text: String,
+    pub purpose: EmbeddingInputPurpose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingInputPurpose {
+    Segment,
+    Query,
+}
+
+impl EmbeddingInput {
+    #[must_use]
+    pub fn segment(text_hash: ContentHash, text: String) -> Self {
+        Self {
+            text_hash,
+            text,
+            purpose: EmbeddingInputPurpose::Segment,
+        }
+    }
+
+    #[must_use]
+    pub fn query(text: String) -> Self {
+        Self {
+            text_hash: ContentHash(QUERY_EMBEDDING_INPUT_CONTRACT_VERSION.into()),
+            text,
+            purpose: EmbeddingInputPurpose::Query,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -642,6 +669,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn segment_and_query_inputs_have_explicit_purpose_contracts() {
+        let segment = EmbeddingInput::segment(ContentHash("blake3:fixture".into()), "body".into());
+        let query = EmbeddingInput::query("question".into());
+        assert_eq!(segment.purpose, EmbeddingInputPurpose::Segment);
+        assert_eq!(query.purpose, EmbeddingInputPurpose::Query);
+        assert_eq!(query.text_hash.0, QUERY_EMBEDDING_INPUT_CONTRACT_VERSION);
+    }
+
     #[cfg(feature = "embeddings-ollama")]
     #[test]
     #[allow(clippy::field_reassign_with_default)]
@@ -712,6 +748,7 @@ mod tests {
                 &[EmbeddingInput {
                     text_hash: ContentHash("blake3:test".into()),
                     text: "private fixture".into(),
+                    purpose: EmbeddingInputPurpose::Segment,
                 }],
                 &model,
             )
@@ -805,6 +842,7 @@ mod tests {
             let inputs = [EmbeddingInput {
                 text_hash: ContentHash("blake3:x".into()),
                 text: "fixture".into(),
+                purpose: EmbeddingInputPurpose::Segment,
             }];
             assert!(provider.embed(&inputs, &model).is_err());
             server.join().unwrap();

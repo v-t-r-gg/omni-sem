@@ -15,7 +15,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{EmbeddingConfig, add_root, init_installation};
-use crate::embedding::EmbeddingProvider;
+use crate::embedding::{EmbeddingBatch, EmbeddingError, EmbeddingProvider, ResolvedEmbeddingModel};
 use crate::embedding_sync::synchronize_with_provider;
 use blake3::Hasher;
 
@@ -91,6 +91,8 @@ pub struct EvalEmbedding {
     pub canonical_model: String,
     pub model_digest: String,
     pub dimensions: u32,
+    pub normalization: String,
+    pub input_contract_version: String,
     pub embedding_space_id: String,
     pub corpus_embedding_ms: u64,
     pub active_vector_coverage: f64,
@@ -113,6 +115,32 @@ pub struct EvalMetricDeltas {
     pub ndcg: f64,
 }
 
+struct PinnedProvider<'a> {
+    inner: &'a dyn EmbeddingProvider,
+    model: ResolvedEmbeddingModel,
+}
+
+impl EmbeddingProvider for PinnedProvider<'_> {
+    fn provider_kind(&self) -> crate::embedding::EmbeddingProviderKind {
+        self.model.provider
+    }
+    fn resolve_model(&self) -> Result<ResolvedEmbeddingModel, EmbeddingError> {
+        Ok(self.model.clone())
+    }
+    fn embed(
+        &self,
+        inputs: &[crate::embedding::EmbeddingInput],
+        model: &ResolvedEmbeddingModel,
+    ) -> Result<EmbeddingBatch, EmbeddingError> {
+        if model != &self.model {
+            return Err(EmbeddingError::Failed(
+                "evaluation model pin mismatch".into(),
+            ));
+        }
+        self.inner.embed(inputs, model)
+    }
+}
+
 /// Aggregate metrics for a run.
 #[derive(Debug, Clone, Serialize)]
 pub struct EvalMetrics {
@@ -127,6 +155,18 @@ pub struct EvalMetrics {
     pub returned_tokens: f64,
     pub p50_latency_ms: f64,
     pub p95_latency_ms: f64,
+    pub p50_query_embedding_ms: f64,
+    pub p95_query_embedding_ms: f64,
+    pub p50_vector_scan_ms: f64,
+    pub p95_vector_scan_ms: f64,
+    pub active_vectors_examined: u64,
+    pub corrupt_vectors_excluded: u64,
+    pub local_lexical_candidates: u64,
+    pub snapshot_lexical_candidates: u64,
+    pub semantic_candidates: u64,
+    pub candidates_admitted_to_fusion: u64,
+    pub unique_fused_candidates: u64,
+    pub fusion_duplicates_suppressed: u64,
 }
 
 /// Per-query metrics and hits.
@@ -140,6 +180,7 @@ pub struct PerQueryResult {
     pub reciprocal_rank: f64,
     pub ndcg: f64,
     pub hits: Vec<EvalHit>,
+    pub telemetry: crate::domain::RetrievalTelemetry,
 }
 
 /// One returned hit for evaluation export.
@@ -188,11 +229,90 @@ pub fn compare_evaluation_with_provider(
     embedding: &EmbeddingConfig,
     provider: &dyn EmbeddingProvider,
 ) -> Result<EvalComparison, RetrievalError> {
-    let lexical = run_evaluation(bundle_dir, RetrievalMode::Lexical)?;
-    let semantic =
-        run_evaluation_with_provider(bundle_dir, RetrievalMode::Semantic, embedding, provider)?;
-    let hybrid =
-        run_evaluation_with_provider(bundle_dir, RetrievalMode::Hybrid, embedding, provider)?;
+    let corpus = read_jsonl::<CorpusRecord>(&bundle_dir.join("corpus.jsonl"))?;
+    let queries = read_jsonl::<QueryRecord>(&bundle_dir.join("queries.jsonl"))?;
+    let judgments = read_jsonl::<JudgmentRecord>(&bundle_dir.join("judgments.jsonl"))?;
+    validate_bundle(&corpus, &queries, &judgments)?;
+    let temp = tempfile::TempDir::new()
+        .map_err(|error| RetrievalError::Evaluation(format!("temp dir failed: {error}")))?;
+    let paths = AppPaths::for_base(temp.path().join("app"));
+    let (mut config, _) = init_installation(&paths)?;
+    let root_dir = temp.path().join("corpus");
+    materialize_corpus(&root_dir, &corpus)?;
+    add_root(&mut config, &root_dir, Some("eval".into()))?;
+    config.embeddings = embedding.clone();
+    config.save(&paths.config_file)?;
+    let mut connection = open_database(&config.database_path()?)?;
+    index_roots(&mut connection, &config, None).map_err(index_to_retrieval)?;
+    let resolved = provider
+        .resolve_model()
+        .map_err(|error| RetrievalError::Evaluation(error.to_string()))?;
+    let pinned = PinnedProvider {
+        inner: provider,
+        model: resolved.clone(),
+    };
+    let started = Instant::now();
+    let sync = synchronize_with_provider(&mut connection, embedding, &pinned)
+        .map_err(|error| RetrievalError::Evaluation(error.to_string()))?;
+    if sync.status != "completed" || sync.missing_segments != 0 {
+        return Err(RetrievalError::Evaluation(
+            "shared comparison embedding synchronization was incomplete".into(),
+        ));
+    }
+    let shared_embedding = EvalEmbedding {
+        provider: resolved.provider.to_string(),
+        canonical_model: resolved.canonical_name,
+        model_digest: resolved.model_digest,
+        dimensions: sync.dimensions.unwrap_or(0),
+        normalization: "l2".into(),
+        input_contract_version: crate::embedding::EMBEDDING_INPUT_CONTRACT_VERSION.into(),
+        embedding_space_id: sync.embedding_space.unwrap_or_default(),
+        corpus_embedding_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        active_vector_coverage: if sync.active_segments == 0 {
+            0.0
+        } else {
+            f64::from(sync.linked_segments) / f64::from(sync.active_segments)
+        },
+    };
+    let lexical = evaluate_existing(
+        &connection,
+        &config,
+        &corpus,
+        &queries,
+        &judgments,
+        RetrievalMode::Lexical,
+        None,
+        Some(shared_embedding.clone()),
+    )?;
+    let semantic = evaluate_existing(
+        &connection,
+        &config,
+        &corpus,
+        &queries,
+        &judgments,
+        RetrievalMode::Semantic,
+        Some(&pinned),
+        Some(shared_embedding.clone()),
+    )?;
+    let hybrid = evaluate_existing(
+        &connection,
+        &config,
+        &corpus,
+        &queries,
+        &judgments,
+        RetrievalMode::Hybrid,
+        Some(&pinned),
+        Some(shared_embedding),
+    )?;
+    if lexical.index_fingerprint != semantic.index_fingerprint
+        || semantic.index_fingerprint != hybrid.index_fingerprint
+        || lexical.config_fingerprint != semantic.config_fingerprint
+        || semantic.config_fingerprint != hybrid.config_fingerprint
+    {
+        return Err(RetrievalError::Evaluation(
+            "shared comparison fingerprints diverged".into(),
+        ));
+    }
     let deltas = |candidate: &EvalReport| EvalMetricDeltas {
         recall_at_5: candidate.metrics.recall_at_5 - lexical.metrics.recall_at_5,
         recall_at_10: candidate.metrics.recall_at_10 - lexical.metrics.recall_at_10,
@@ -266,6 +386,8 @@ fn run_evaluation_inner(
             canonical_model: model.canonical_name,
             model_digest: model.model_digest,
             dimensions: report.dimensions.unwrap_or(0),
+            normalization: "l2".into(),
+            input_contract_version: crate::embedding::EMBEDDING_INPUT_CONTRACT_VERSION.into(),
             embedding_space_id: report.embedding_space.unwrap_or_default(),
             corpus_embedding_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             active_vector_coverage: if report.active_segments == 0 {
@@ -276,6 +398,38 @@ fn run_evaluation_inner(
         })
     };
 
+    evaluate_existing(
+        &connection,
+        &config,
+        &corpus,
+        &queries,
+        &judgments,
+        effective,
+        provider,
+        embedding_report,
+    )
+}
+
+fn index_to_retrieval(error: IndexError) -> RetrievalError {
+    match error {
+        IndexError::Config(error) => RetrievalError::Config(error),
+        IndexError::Storage(error) => RetrievalError::Storage(error),
+        IndexError::Domain(error) => RetrievalError::Domain(error),
+        other => RetrievalError::Evaluation(other.to_string()),
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn evaluate_existing(
+    connection: &Connection,
+    config: &crate::config::AppConfig,
+    corpus: &[CorpusRecord],
+    queries: &[QueryRecord],
+    judgments: &[JudgmentRecord],
+    effective: RetrievalMode,
+    provider: Option<&dyn EmbeddingProvider>,
+    embedding_report: Option<EvalEmbedding>,
+) -> Result<EvalReport, RetrievalError> {
     let path_to_doc = corpus
         .iter()
         .map(|item| (item.path.clone(), item.document_id.clone()))
@@ -287,7 +441,7 @@ fn run_evaluation_inner(
 
     let mut per_query = Vec::new();
     let mut latencies = Vec::new();
-    for query in &queries {
+    for query in queries {
         let judgment = judgment_map.get(&query.query_id).ok_or_else(|| {
             RetrievalError::Evaluation(format!("missing judgment {}", query.query_id))
         })?;
@@ -303,12 +457,12 @@ fn run_evaluation_inner(
         };
         let started = Instant::now();
         let response = if effective == RetrievalMode::Lexical {
-            retrieve(&connection, &config, &request)?
+            retrieve(connection, config, &request)?
         } else {
-            let scanner = SqliteExactVectorSearch;
+            let scanner = SqliteExactVectorSearch::default();
             retrieve_with_runtime(
-                &connection,
-                &config,
+                connection,
+                config,
                 &request,
                 &RetrievalRuntime {
                     embedding_provider: provider,
@@ -356,17 +510,18 @@ fn run_evaluation_inner(
             reciprocal_rank,
             ndcg,
             hits,
+            telemetry: response.telemetry,
         });
     }
 
     let metrics = aggregate_metrics(&per_query, &judgment_map, &latencies);
     let config_fingerprint = blake3_hex(
-        serde_json::to_string(&config.retrieval)
+        serde_json::to_string(&(config.retrieval.clone(), config.embeddings.clone()))
             .unwrap_or_default()
             .as_bytes(),
     )
     .0;
-    let index_fingerprint = index_fingerprint(&connection)?;
+    let index_fingerprint = index_fingerprint(connection)?;
 
     Ok(EvalReport {
         run_id: uuid::Uuid::new_v4().to_string(),
@@ -508,7 +663,7 @@ fn ndcg_at(refs: &[String], grades: &HashMap<String, f64>, k: usize) -> f64 {
     if idcg == 0.0 { 0.0 } else { dcg / idcg }
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn aggregate_metrics(
     per_query: &[PerQueryResult],
     judgments: &HashMap<String, JudgmentRecord>,
@@ -596,6 +751,66 @@ fn aggregate_metrics(
         returned_tokens,
         p50_latency_ms: percentile(latencies, 0.50),
         p95_latency_ms: percentile(latencies, 0.95),
+        p50_query_embedding_ms: percentile(
+            &per_query
+                .iter()
+                .map(|item| item.telemetry.query_embedding_ms)
+                .collect::<Vec<_>>(),
+            0.50,
+        ),
+        p95_query_embedding_ms: percentile(
+            &per_query
+                .iter()
+                .map(|item| item.telemetry.query_embedding_ms)
+                .collect::<Vec<_>>(),
+            0.95,
+        ),
+        p50_vector_scan_ms: percentile(
+            &per_query
+                .iter()
+                .map(|item| item.telemetry.vector_scan_ms)
+                .collect::<Vec<_>>(),
+            0.50,
+        ),
+        p95_vector_scan_ms: percentile(
+            &per_query
+                .iter()
+                .map(|item| item.telemetry.vector_scan_ms)
+                .collect::<Vec<_>>(),
+            0.95,
+        ),
+        active_vectors_examined: per_query
+            .iter()
+            .map(|item| u64::from(item.telemetry.active_vectors_examined))
+            .sum(),
+        corrupt_vectors_excluded: per_query
+            .iter()
+            .map(|item| u64::from(item.telemetry.corrupt_vectors_excluded))
+            .sum(),
+        local_lexical_candidates: per_query
+            .iter()
+            .map(|item| u64::from(item.telemetry.local_lexical_candidates))
+            .sum(),
+        snapshot_lexical_candidates: per_query
+            .iter()
+            .map(|item| u64::from(item.telemetry.snapshot_lexical_candidates))
+            .sum(),
+        semantic_candidates: per_query
+            .iter()
+            .map(|item| u64::from(item.telemetry.semantic_candidates))
+            .sum(),
+        candidates_admitted_to_fusion: per_query
+            .iter()
+            .map(|item| u64::from(item.telemetry.candidates_admitted_to_fusion))
+            .sum(),
+        unique_fused_candidates: per_query
+            .iter()
+            .map(|item| u64::from(item.telemetry.unique_fused_candidates))
+            .sum(),
+        fusion_duplicates_suppressed: per_query
+            .iter()
+            .map(|item| u64::from(item.telemetry.fusion_duplicates_suppressed))
+            .sum(),
     }
 }
 
@@ -732,11 +947,16 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
 
-    struct EvalFake;
+    #[derive(Default)]
+    struct EvalFake {
+        segment_batches: AtomicUsize,
+        query_calls: AtomicUsize,
+    }
     impl EmbeddingProvider for EvalFake {
         fn provider_kind(&self) -> EmbeddingProviderKind {
             EmbeddingProviderKind::Ollama
@@ -755,6 +975,18 @@ mod tests {
             inputs: &[EmbeddingInput],
             _: &ResolvedEmbeddingModel,
         ) -> Result<EmbeddingBatch, EmbeddingError> {
+            if inputs
+                .iter()
+                .all(|input| input.purpose == crate::embedding::EmbeddingInputPurpose::Segment)
+            {
+                self.segment_batches.fetch_add(1, Ordering::SeqCst);
+            }
+            if inputs
+                .iter()
+                .all(|input| input.purpose == crate::embedding::EmbeddingInputPurpose::Query)
+            {
+                self.query_calls.fetch_add(inputs.len(), Ordering::SeqCst);
+            }
             Ok(EmbeddingBatch {
                 vectors: inputs
                     .iter()
@@ -791,15 +1023,56 @@ mod tests {
             &bundle,
             RetrievalMode::Semantic,
             &eval_embedding(),
-            &EvalFake,
+            &EvalFake::default(),
         )
         .unwrap();
         assert_eq!(semantic.mode, "semantic");
         assert!(semantic.embedding.is_some());
+        let user_temp = TempDir::new().unwrap();
+        let user_paths = AppPaths::for_base(user_temp.path().join("user"));
+        let (user_config, _) = init_installation(&user_paths).unwrap();
+        let user_connection = open_database(&user_config.database_path().unwrap()).unwrap();
+        let user_changes = user_connection.total_changes();
+        let fake = EvalFake::default();
         let comparison =
-            compare_evaluation_with_provider(&bundle, &eval_embedding(), &EvalFake).unwrap();
+            compare_evaluation_with_provider(&bundle, &eval_embedding(), &fake).unwrap();
         assert_eq!(comparison.lexical.mode, "lexical");
         assert_eq!(comparison.hybrid.mode, "hybrid");
+        assert_eq!(fake.segment_batches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            comparison.lexical.index_fingerprint,
+            comparison.semantic.index_fingerprint
+        );
+        assert_eq!(
+            comparison.semantic.index_fingerprint,
+            comparison.hybrid.index_fingerprint
+        );
+        assert_eq!(
+            comparison.lexical.config_fingerprint,
+            comparison.hybrid.config_fingerprint
+        );
+        assert_eq!(
+            comparison
+                .semantic
+                .embedding
+                .as_ref()
+                .unwrap()
+                .embedding_space_id,
+            comparison
+                .hybrid
+                .embedding
+                .as_ref()
+                .unwrap()
+                .embedding_space_id
+        );
+        assert!(
+            (comparison.semantic_minus_lexical.mrr
+                - (comparison.semantic.metrics.mrr - comparison.lexical.metrics.mrr))
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(comparison.semantic.metrics.p95_query_embedding_ms >= 0.0);
+        assert_eq!(user_connection.total_changes(), user_changes);
     }
 
     #[test]
@@ -861,6 +1134,7 @@ mod tests {
             reciprocal_rank: 1.0,
             ndcg: 1.0,
             hits,
+            telemetry: crate::domain::RetrievalTelemetry::default(),
         }];
         let judgments = HashMap::from([(
             "q".into(),

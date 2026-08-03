@@ -990,6 +990,19 @@ fn cmd_query(
             response.truncated,
             response.elapsed_ms
         );
+        println!(
+            "query_embedding_ms={:.3} vector_scan_ms={:.3} vectors_examined={} corrupt_excluded={} local_lexical={} snapshot_lexical={} semantic={} fusion_admitted={} fusion_unique={} fusion_duplicates={}",
+            response.telemetry.query_embedding_ms,
+            response.telemetry.vector_scan_ms,
+            response.telemetry.active_vectors_examined,
+            response.telemetry.corrupt_vectors_excluded,
+            response.telemetry.local_lexical_candidates,
+            response.telemetry.snapshot_lexical_candidates,
+            response.telemetry.semantic_candidates,
+            response.telemetry.candidates_admitted_to_fusion,
+            response.telemetry.unique_fused_candidates,
+            response.telemetry.fusion_duplicates_suppressed,
+        );
     }
     Ok(ExitCode::Success)
 }
@@ -1071,6 +1084,13 @@ fn print_eval_report(report: &omnisem_core::eval::EvalReport) {
     println!(
         "p50_ms={:.2} p95_ms={:.2}",
         report.metrics.p50_latency_ms, report.metrics.p95_latency_ms
+    );
+    println!(
+        "query_embedding_p50_ms={:.2} query_embedding_p95_ms={:.2} vector_scan_p50_ms={:.2} vector_scan_p95_ms={:.2}",
+        report.metrics.p50_query_embedding_ms,
+        report.metrics.p95_query_embedding_ms,
+        report.metrics.p50_vector_scan_ms,
+        report.metrics.p95_vector_scan_ms,
     );
 }
 

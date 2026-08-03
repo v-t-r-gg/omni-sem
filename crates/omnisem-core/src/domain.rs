@@ -684,7 +684,23 @@ pub struct RetrievalResponse {
     pub budget_preset: Option<String>,
     pub duplicates_suppressed: u32,
     pub warnings: Vec<String>,
+    pub telemetry: RetrievalTelemetry,
     pub elapsed_ms: u64,
+}
+
+/// Bounded operational measurements for one retrieval invocation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalTelemetry {
+    pub query_embedding_ms: f64,
+    pub vector_scan_ms: f64,
+    pub active_vectors_examined: u32,
+    pub corrupt_vectors_excluded: u32,
+    pub local_lexical_candidates: u32,
+    pub snapshot_lexical_candidates: u32,
+    pub semantic_candidates: u32,
+    pub candidates_admitted_to_fusion: u32,
+    pub unique_fused_candidates: u32,
+    pub fusion_duplicates_suppressed: u32,
 }
 
 /// Domain validation failures.
