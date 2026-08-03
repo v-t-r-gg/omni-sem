@@ -58,3 +58,4 @@ Bounded samples of query timing/mode/result counts **without** query strings or 
 ## Compatibility
 
 Upgrade path: empty / v1 / v2 → migrate to v3. Downgrades are unsupported. Derived databases may be rebuilt when needed.
+Milestone 4B requires no migration: schema version 4 already provides embedding spaces, normalized vector cache rows, and active segment references. Query text, query hashes, query vectors, and retrieval results are deliberately not stored.

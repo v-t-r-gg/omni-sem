@@ -585,6 +585,16 @@ pub struct RetrievalSignals {
     /// Final federation score when multiple indexes contribute (RRF).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federation_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_rank: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_rank: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cosine_similarity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_space_id: Option<String>,
 }
 
 /// Deterministic match explanation without model inference.
@@ -663,7 +673,9 @@ pub struct RetrievalHit {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalResponse {
     pub query: String,
+    pub requested_mode: RetrievalMode,
     pub mode: RetrievalMode,
+    pub score_kind: String,
     pub results: Vec<RetrievalHit>,
     pub token_estimate: u32,
     pub truncated: bool,
@@ -672,7 +684,23 @@ pub struct RetrievalResponse {
     pub budget_preset: Option<String>,
     pub duplicates_suppressed: u32,
     pub warnings: Vec<String>,
+    pub telemetry: RetrievalTelemetry,
     pub elapsed_ms: u64,
+}
+
+/// Bounded operational measurements for one retrieval invocation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RetrievalTelemetry {
+    pub query_embedding_ms: f64,
+    pub vector_scan_ms: f64,
+    pub active_vectors_examined: u32,
+    pub corrupt_vectors_excluded: u32,
+    pub local_lexical_candidates: u32,
+    pub snapshot_lexical_candidates: u32,
+    pub semantic_candidates: u32,
+    pub candidates_admitted_to_fusion: u32,
+    pub unique_fused_candidates: u32,
+    pub fusion_duplicates_suppressed: u32,
 }
 
 /// Domain validation failures.

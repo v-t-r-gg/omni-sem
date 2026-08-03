@@ -1,6 +1,6 @@
 # Retrieval evaluation
 
-Milestone 4A does not add semantic evaluation. Evaluation remains lexical-only; lexical/semantic/hybrid comparison is deferred with query-vector generation and vector ranking to Milestone 4B.
+Milestone 4B supports isolated lexical, semantic, hybrid, and comparison evaluation. Semantic-capable runs copy only the explicit embedding configuration into a temporary installation, materialize the fixture corpus and its vectors there, and never use the user's roots, snapshots, or database. Lexical evaluation constructs no provider.
 
 ## Bundle layout
 
@@ -10,6 +10,7 @@ evals/
   queries.jsonl
   judgments.jsonl
   schema/
+  semantic/
 ```
 
 ## Relevance grades
@@ -54,6 +55,12 @@ Row UUIDs are omitted so equivalent corpora fingerprint identically across re-in
 ## Isolation
 
 Evaluation always builds a temporary data root and database. The user’s configured index is never modified. Imported snapshots are **not** part of the default evaluation path; reference lexical metrics remain local-only unless a bundle explicitly includes snapshots.
+
+`omnisem eval --compare` materializes and lexically indexes one physical temporary corpus while embeddings are disabled, verifies that no synchronization run occurred, then installs the requested embedding configuration, resolves one compatibility identity, and synchronizes exactly once through the injected provider. Lexical, semantic, and hybrid queries run against that shared connection and embedding space. All reports carry identical configuration/index fingerprints and one shared embedding identity and corpus-embedding duration.
+
+Before every query embedding, the provider is resolved again and provider kind, canonical model, digest, and dimensions are compared with the saved identity. A change fails before query embedding. This is compatibility revalidation, not digest-addressed serving: Ollama `/api/embed` still receives the explicitly configured model tag, because the transport cannot force a digest through that API contract. Results depend on corpus and exact model digest; the report does not assert that one mode is intrinsically superior.
+
+Per-query and aggregate telemetry separates query-embedding and exact-vector-scan latency and reports p50/p95 values, active vectors examined, corrupt exclusions, local/snapshot/semantic candidate counts, fusion admissions, unique fused candidates, and duplicate suppression. Corpus synchronization is excluded from query latency.
 
 ## Snapshot federation (runtime query, not default eval)
 

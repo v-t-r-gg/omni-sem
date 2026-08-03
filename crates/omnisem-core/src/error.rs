@@ -113,6 +113,8 @@ pub enum RetrievalError {
     Domain(#[from] DomainError),
     #[error("evaluation bundle error: {0}")]
     Evaluation(String),
+    #[error("{code}: {message}")]
+    Semantic { code: &'static str, message: String },
     #[error("internal retrieval error: {0}")]
     Internal(String),
 }
@@ -126,6 +128,7 @@ impl RetrievalError {
             Self::Storage(_) => ExitCode::Database,
             Self::Domain(DomainError::BudgetPresetNotFound(_)) => ExitCode::Configuration,
             Self::Domain(_) | Self::Evaluation(_) => ExitCode::InvalidInput,
+            Self::Semantic { .. } => ExitCode::Protocol,
             Self::Internal(_) => ExitCode::Internal,
         }
     }

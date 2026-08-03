@@ -63,11 +63,15 @@ Reports additions, modifications, and deletions from stored source/revision reco
 
 ### `omnisem query QUERY [options]`
 
-Lexical retrieval over active FTS rows.
+Lexical, semantic, hybrid, or automatic retrieval over indexed evidence.
 
 Options:
 
-- `--mode lexical|auto|semantic|hybrid` (`semantic`/`hybrid` unavailable)
+- `--mode lexical|auto|semantic|hybrid`
+  - `lexical`: provider-inert FTS plus eligible snapshot federation
+  - `semantic`: compatible active local embedding-space search
+  - `hybrid`: one-pass local lexical, snapshot lexical, and local semantic fusion
+  - `auto`: lexical fallback; may attempt hybrid after explicit embedding enablement
 - `--root ROOT_ID`
 - `--file-type markdown|plain_text`
 - `--limit N`
@@ -125,3 +129,12 @@ After resolution, doctor requires the active persisted provider, canonical model
 ### Query provenance
 
 JSON hits include `origin` (`local_index` or `snapshot` with ids). Human output marks snapshot results. Federation uses RRF when snapshots contribute; local BM25 path is unchanged when no snapshots are eligible.
+### Query modes
+
+`omnisem query TEXT --mode lexical|semantic|hybrid|auto` reports requested and effective modes. Lexical is network-inert. Semantic requires a compatible active local embedding space. Hybrid requires that semantic channel and fuses local FTS, eligible snapshot FTS lists, and local vector results once with RRF. Auto uses lexical when embeddings are disabled or unavailable and emits a bounded warning; after embeddings are explicitly enabled it may contact the configured provider.
+
+The query JSON envelope is version 2 and includes `requested_mode`, effective `mode`, `score_kind`, lexical/semantic ranks, cosine similarity, fusion score, and embedding-space ID when applicable.
+
+Its structured `telemetry` object reports bounded timings and candidate counts without query text, hashes, vectors, endpoints, credentials, or provider bodies. Lexical ranks are one-based within the local FTS list or the contributing snapshot list; semantic ranks are one-based within the local vector list.
+
+`omnisem eval --mode lexical|semantic|hybrid` runs an isolated evaluation. `omnisem eval --compare` produces all three reports and deltas. Semantic-capable evaluation requires explicit enabled embedding configuration.

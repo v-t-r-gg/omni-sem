@@ -18,6 +18,26 @@ use crate::hash::blake3_hex;
 
 /// Versioned text-to-provider input contract.
 pub const EMBEDDING_INPUT_CONTRACT_VERSION: &str = "segment-text-v1";
+/// Versioned contract for transient query text sent to an embedding provider.
+pub const QUERY_EMBEDDING_INPUT_CONTRACT_VERSION: &str = "query-text-v1";
+
+/// Constructs the explicitly configured production provider.
+pub fn configured_provider(
+    config: &EmbeddingConfig,
+) -> Result<Box<dyn EmbeddingProvider>, EmbeddingError> {
+    if !config.enabled {
+        return Err(EmbeddingError::Unavailable);
+    }
+    #[cfg(feature = "embeddings-ollama")]
+    {
+        Ok(Box::new(ollama::OllamaProvider::new(config)?))
+    }
+    #[cfg(not(feature = "embeddings-ollama"))]
+    {
+        let _ = config;
+        Err(EmbeddingError::FeatureDisabled)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -96,6 +116,33 @@ impl EmbeddingSpace {
 pub struct EmbeddingInput {
     pub text_hash: ContentHash,
     pub text: String,
+    pub purpose: EmbeddingInputPurpose,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingInputPurpose {
+    Segment,
+    Query,
+}
+
+impl EmbeddingInput {
+    #[must_use]
+    pub fn segment(text_hash: ContentHash, text: String) -> Self {
+        Self {
+            text_hash,
+            text,
+            purpose: EmbeddingInputPurpose::Segment,
+        }
+    }
+
+    #[must_use]
+    pub fn query(text: String) -> Self {
+        Self {
+            text_hash: ContentHash(QUERY_EMBEDDING_INPUT_CONTRACT_VERSION.into()),
+            text,
+            purpose: EmbeddingInputPurpose::Query,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,6 +192,8 @@ pub enum EmbeddingError {
     FeatureDisabled,
     #[error("EMBEDDING_MODEL_NOT_FOUND: configured model was not reported by Ollama")]
     ModelNotFound,
+    #[error("EMBEDDING_MODEL_CHANGED: resolved model compatibility changed")]
+    ModelChanged,
     #[error("EMBEDDING_FAILED: {0}")]
     Failed(String),
     #[error("EMBEDDING_RESPONSE_INVALID: {0}")]
@@ -164,6 +213,7 @@ impl EmbeddingError {
             Self::Unavailable => "EMBEDDING_UNAVAILABLE",
             Self::FeatureDisabled => "EMBEDDING_FEATURE_DISABLED",
             Self::ModelNotFound => "EMBEDDING_MODEL_NOT_FOUND",
+            Self::ModelChanged => "EMBEDDING_MODEL_CHANGED",
             Self::Failed(_) => "EMBEDDING_FAILED",
             Self::ResponseInvalid(_) => "EMBEDDING_RESPONSE_INVALID",
             Self::DimensionMismatch { .. } => "EMBEDDING_DIMENSION_MISMATCH",
@@ -175,7 +225,11 @@ impl EmbeddingError {
     pub fn systemic(&self) -> bool {
         matches!(
             self,
-            Self::Unavailable | Self::FeatureDisabled | Self::ModelNotFound | Self::Failed(_)
+            Self::Unavailable
+                | Self::FeatureDisabled
+                | Self::ModelNotFound
+                | Self::ModelChanged
+                | Self::Failed(_)
         )
     }
 }
@@ -622,6 +676,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn segment_and_query_inputs_have_explicit_purpose_contracts() {
+        let segment = EmbeddingInput::segment(ContentHash("blake3:fixture".into()), "body".into());
+        let query = EmbeddingInput::query("question".into());
+        assert_eq!(segment.purpose, EmbeddingInputPurpose::Segment);
+        assert_eq!(query.purpose, EmbeddingInputPurpose::Query);
+        assert_eq!(query.text_hash.0, QUERY_EMBEDDING_INPUT_CONTRACT_VERSION);
+    }
+
     #[cfg(feature = "embeddings-ollama")]
     #[test]
     #[allow(clippy::field_reassign_with_default)]
@@ -692,6 +755,7 @@ mod tests {
                 &[EmbeddingInput {
                     text_hash: ContentHash("blake3:test".into()),
                     text: "private fixture".into(),
+                    purpose: EmbeddingInputPurpose::Segment,
                 }],
                 &model,
             )
@@ -785,6 +849,7 @@ mod tests {
             let inputs = [EmbeddingInput {
                 text_hash: ContentHash("blake3:x".into()),
                 text: "fixture".into(),
+                purpose: EmbeddingInputPurpose::Segment,
             }];
             assert!(provider.embed(&inputs, &model).is_err());
             server.join().unwrap();

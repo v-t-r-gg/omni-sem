@@ -19,3 +19,4 @@
 `ureq` is exposed by default feature `embeddings-ollama`; `--no-default-features` removes it and configured Ollama returns `EMBEDDING_FEATURE_DISABLED` while lexical operations work. `reqwest` was rejected for its larger async graph; `minreq` for its smaller ecosystem/policy surface. `url` avoids security-sensitive hand parsing. Rustls supplies TLS; no new direct dependency adds native code. The agent explicitly disables environment proxies and redirects. Compile impact is the Rustls and URL/IDNA graph; binary-size impact was not separately measured.
 
 Unsafe code is forbidden in workspace crates. Bundled SQLite remains the intentional native boundary.
+Milestone 4B adds no runtime dependency. Exact search uses `rusqlite` and safe vector decoding already present; fusion uses the standard library. This avoids native ANN/vector-extension packaging and keeps no-default-feature lexical builds unchanged.
