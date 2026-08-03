@@ -16,6 +16,8 @@ Required fields include format version (`1`), schema compatibility `{min,max}`, 
 
 Snapshot v1 remains lexical-only. Local caches and vectors are not exported, and import rejects nonempty `embedding_spaces`. Imported evidence cannot participate in semantic retrieval; portable vectors require a future format revision.
 
+Schema compatibility is `2..=4`; schema v4 support does not change the v1 payload or add vectors.
+
 ## Payload
 
 Active-only sanitized tables: logical roots, relative source paths, revisions, segments, FTS. No absolute source paths, no operational secrets, no query text.

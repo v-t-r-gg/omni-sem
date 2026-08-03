@@ -54,6 +54,7 @@ pub fn synchronize_embeddings(
     connection: &mut Connection,
     config: &EmbeddingConfig,
 ) -> Result<EmbeddingSyncReport, StorageError> {
+    let _ = &connection;
     if !config.enabled {
         return Ok(disabled_report());
     }

@@ -131,7 +131,7 @@ pub fn export_snapshot(
     let manifest = SnapshotManifest {
         snapshot_format_version: SNAPSHOT_FORMAT_VERSION,
         omnisem_version: env!("CARGO_PKG_VERSION").into(),
-        schema_compatibility: SchemaCompatibility { min: 2, max: 3 },
+        schema_compatibility: SchemaCompatibility { min: 2, max: 4 },
         created_at_ms: Timestamp::now().map_or(0, Timestamp::as_millis),
         payload_checksum: checksum.clone(),
         roots: roots.clone(),
@@ -1088,8 +1088,8 @@ fn validate_manifest_compatibility(
             message: "contradictory schema compatibility range".into(),
         });
     }
-    // This installation currently supports schema versions through 3.
-    if manifest.schema_compatibility.min > 3 || manifest.schema_compatibility.max < 2 {
+    // Snapshot format v1 is lexical-only but installations through schema v4 support it.
+    if manifest.schema_compatibility.min > 4 || manifest.schema_compatibility.max < 2 {
         return Err(ConfigError::Invalid {
             path: snapshot_dir.to_path_buf(),
             message: "snapshot schema range is not supported by this installation".into(),
