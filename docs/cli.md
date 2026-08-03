@@ -63,11 +63,15 @@ Reports additions, modifications, and deletions from stored source/revision reco
 
 ### `omnisem query QUERY [options]`
 
-Lexical retrieval over active FTS rows.
+Lexical, semantic, hybrid, or automatic retrieval over indexed evidence.
 
 Options:
 
-- `--mode lexical|auto|semantic|hybrid` (`semantic`/`hybrid` unavailable)
+- `--mode lexical|auto|semantic|hybrid`
+  - `lexical`: provider-inert FTS plus eligible snapshot federation
+  - `semantic`: compatible active local embedding-space search
+  - `hybrid`: one-pass local lexical, snapshot lexical, and local semantic fusion
+  - `auto`: lexical fallback; may attempt hybrid after explicit embedding enablement
 - `--root ROOT_ID`
 - `--file-type markdown|plain_text`
 - `--limit N`

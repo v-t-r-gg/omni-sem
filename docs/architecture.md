@@ -23,7 +23,7 @@ configuration + approved roots
 
 ## Lexical ranking
 
-FTS5 `bm25(segments_fts)` is lower-is-better and typically negative. Public `score` is `-raw_bm25` so higher is better. This is **not** normalized to `[0, 1]` and is not comparable with future semantic or hybrid scores. Raw BM25 remains in `RetrievalSignals.raw_bm25`. Tie-breakers: relative path, anchor, segment id ascending. Candidates capped at `min(limit*8, 200)`.
+FTS5 `bm25(segments_fts)` is lower-is-better and typically negative. Public `score` is `-raw_bm25` so higher is better. This is **not** normalized to `[0, 1]` and is not comparable with semantic or hybrid scores. Raw BM25 remains in `RetrievalSignals.raw_bm25`. Tie-breakers: relative path, anchor, segment id ascending. Candidates capped at `min(limit*8, 200)`.
 
 When imported snapshots are eligible, lists are fused with Reciprocal Rank Fusion (`k=60`). Final score becomes the RRF federation score; raw BM25 is retained per channel. Local-only queries keep the BM25 public score path.
 
@@ -35,7 +35,7 @@ Format v1 remains lexical-only: local embedding spaces, vectors, references, fai
 
 ## Embedding materialization
 
-The synchronous `EmbeddingProvider` boundary contains no Ollama transport types. Lexical indexing commits first; enabled synchronization then resolves an exact model digest, derives a deterministic compatibility-space ID, links cache hits, and calls the provider outside SQLite transactions. Cache persistence and segment linking are transactional per successful batch. Provider failure cannot roll back a lexical revision. Semantic querying is deferred to Milestone 4B.
+The synchronous `EmbeddingProvider` boundary contains no Ollama transport types. Lexical indexing commits first; enabled synchronization then resolves an exact model digest, derives a deterministic compatibility-space ID, links cache hits, and calls the provider outside SQLite transactions. Cache persistence and segment linking are transactional per successful batch. Provider failure cannot roll back a lexical revision. Semantic querying uses transient query embeddings only after verifying a compatible active local embedding space.
 
 Persisted cache hits are loaded, dimension-checked, decoded, and verified as already L2-normalized before linkage. Fresh provider batches are count/dimension/value validated and normalized in memory before any database mutation. Malformed batches become bounded partial failures rather than storage failures.
 
