@@ -4,6 +4,13 @@ All notable changes will be documented here. The format follows Keep a Changelog
 
 ## Unreleased
 
+### Added (Milestone 5)
+
+- Read-only `omnisem mcp` server over STDIO using the official Rust MCP SDK.
+- Bounded `search_context`, `get_context`, and `index_status` tools plus strict Omni-Sem resources.
+- MCP-specific retrieval audience that excludes sensitive evidence before ranking, fusion, deduplication, and packing.
+- Protocol, prompt-injection, path-rejection, snapshot-sensitivity, provider-inertness, and read-only integration coverage.
+
 ### Added (Milestone 4A)
 
 - Safe-default embedding configuration and feature-gated blocking Ollama transport using `/api/tags` and `/api/embed`.

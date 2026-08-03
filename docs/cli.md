@@ -126,6 +126,12 @@ Checks configuration, database/schema/FTS, roots, parsers, embedding feature/con
 
 After resolution, doctor requires the active persisted provider, canonical model, digest, and configured dimensions to agree.
 
+### `omnisem mcp`
+
+Runs the read-only MCP server over STDIO. Stdout is protocol-only; diagnostics go to stderr. The server exposes `search_context`, `get_context`, `index_status`, `omnisem://status`, and bounded local/snapshot segment resource templates. It never initializes or migrates a database. A build without the `mcp` Cargo feature exits with `MCP_FEATURE_DISABLED`.
+
+MCP search accepts lexical, semantic, hybrid, and auto modes. Lexical search and status are provider-inert; other modes follow the explicit embedding configuration. MCP has no sensitive-content override, write tool, filesystem path input, root-management operation, or HTTP transport.
+
 ### Query provenance
 
 JSON hits include `origin` (`local_index` or `snapshot` with ids). Human output marks snapshot results. Federation uses RRF when snapshots contribute; local BM25 path is unchanged when no snapshots are eligible.

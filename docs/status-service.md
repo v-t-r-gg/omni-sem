@@ -51,3 +51,5 @@ No permissive CORS.
 
 Status JSON includes registered, queryable, unhealthy payload counts, and mapped/unmapped root totals from the snapshot registry.
 The status service remains persisted-state-only and provider-inert. Retrieval requested/effective modes and query vectors are not retained or exposed by the service.
+
+The MCP `index_status` tool and `omnisem://status` resource reuse a narrower safe projection through a request-scoped read-only connection. They do not start this HTTP server, expose filesystem/database paths, run migrations, or contact an embedding provider.
