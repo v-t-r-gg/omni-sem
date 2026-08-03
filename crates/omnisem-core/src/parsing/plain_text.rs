@@ -71,12 +71,12 @@ pub fn split_plain_text(text: &str, max_chars: usize) -> Vec<ParsedSegment> {
     while start < chars.len() {
         let hard_end = (start + max_chars).min(chars.len());
         let mut end = hard_end;
-        if hard_end < chars.len() {
-            if let Some(relative) = chars[start..hard_end].iter().rposition(|ch| *ch == '\n') {
-                let candidate = start + relative + 1;
-                if candidate > start {
-                    end = candidate;
-                }
+        if hard_end < chars.len()
+            && let Some(relative) = chars[start..hard_end].iter().rposition(|ch| *ch == '\n')
+        {
+            let candidate = start + relative + 1;
+            if candidate > start {
+                end = candidate;
             }
         }
 
