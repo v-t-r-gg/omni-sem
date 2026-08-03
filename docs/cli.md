@@ -99,6 +99,8 @@ Lifecycle without exposing managed absolute paths, exporter machine paths, or so
 
 CLI and server status include persisted active embedding space/model/digest, dimensions, coverage, failures, and latest sync. They never contact Ollama and never expose endpoint URLs, source/query text, vectors, or provider bodies.
 
+They also expose a configured-versus-active compatibility state. Normal status can compare provider, canonical tag form, and configured dimensions without network; digest confirmation is explicitly marked as requiring provider resolution.
+
 Supported methods and routes:
 
 | Method | Paths |
@@ -117,6 +119,8 @@ Supported methods and routes:
 ### `omnisem doctor [--json]`
 
 Checks configuration, database/schema/FTS, roots, parsers, embedding feature/configuration, provider/model, coverage/failures, and snapshot registry. Disabled embeddings return `disabled` successfully without network access. Enabled Ollama resolves `/api/tags`; doctor does not call `/api/embed` or `/api/pull`.
+
+After resolution, doctor requires the active persisted provider, canonical model, digest, and configured dimensions to agree.
 
 ### Query provenance
 

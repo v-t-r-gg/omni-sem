@@ -225,6 +225,33 @@ pub fn normalize_vector(values: &[f32]) -> Result<EmbeddingVector, EmbeddingErro
     Ok(EmbeddingVector { values: normalized })
 }
 
+/// Validates that persisted values are already finite, nonzero, and L2 normalized.
+pub fn validate_normalized_vector(values: &[f32]) -> Result<(), EmbeddingError> {
+    if values.is_empty() {
+        return Err(EmbeddingError::CacheCorrupt("empty vector".into()));
+    }
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(EmbeddingError::CacheCorrupt(
+            "vector contains a non-finite component".into(),
+        ));
+    }
+    let norm_sq = values
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>();
+    if !norm_sq.is_finite() || norm_sq <= f64::EPSILON {
+        return Err(EmbeddingError::CacheCorrupt(
+            "vector has zero or invalid norm".into(),
+        ));
+    }
+    if (norm_sq - 1.0).abs() > 1.0e-4 {
+        return Err(EmbeddingError::CacheCorrupt(
+            "vector is not L2 normalized".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Encodes normalized f32 values in deterministic little-endian order.
 pub fn encode_vector(vector: &EmbeddingVector, dimensions: u32) -> Result<Vec<u8>, EmbeddingError> {
     if vector.values.len() != dimensions as usize {
@@ -254,18 +281,8 @@ pub fn decode_vector(bytes: &[u8], dimensions: u32) -> Result<EmbeddingVector, E
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
         .collect::<Vec<_>>();
-    let vector = normalize_vector(&values)?;
-    let norm = vector
-        .values
-        .iter()
-        .map(|value| f64::from(*value) * f64::from(*value))
-        .sum::<f64>();
-    if (norm - 1.0).abs() > 1.0e-4 {
-        return Err(EmbeddingError::CacheCorrupt(
-            "vector is not L2 normalized".into(),
-        ));
-    }
-    Ok(vector)
+    validate_normalized_vector(&values)?;
+    Ok(EmbeddingVector { values })
 }
 
 #[cfg(feature = "embeddings-ollama")]
@@ -467,6 +484,92 @@ pub mod ollama {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "embeddings-ollama")]
+    struct MockReply {
+        status: u16,
+        body: Vec<u8>,
+        delay_ms: u64,
+    }
+
+    #[cfg(feature = "embeddings-ollama")]
+    fn mock_server(
+        replies: Vec<MockReply>,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let server = std::thread::spawn(move || {
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buffer[..read]);
+                    let Some(end) = bytes
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4)
+                    else {
+                        continue;
+                    };
+                    let header = String::from_utf8_lossy(&bytes[..end]);
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if bytes.len() >= end + length {
+                        break;
+                    }
+                }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&bytes).into_owned());
+                if reply.delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(reply.delay_ms));
+                }
+                let reason = if reply.status == 200 { "OK" } else { "Error" };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.status,
+                    reason,
+                    reply.body.len()
+                );
+                let _ = stream.write_all(&reply.body);
+            }
+        });
+        (address, requests, server)
+    }
+
+    #[cfg(feature = "embeddings-ollama")]
+    fn ollama_config(address: std::net::SocketAddr) -> EmbeddingConfig {
+        use crate::config::EmbeddingProviderConfig;
+        EmbeddingConfig {
+            enabled: true,
+            provider: EmbeddingProviderConfig::Ollama,
+            endpoint: format!("http://{address}"),
+            model: "fixture".into(),
+            dimensions: 8,
+            ..EmbeddingConfig::default()
+        }
+    }
     #[test]
     fn space_identity_tracks_contract() {
         let model = ResolvedEmbeddingModel {
@@ -497,6 +600,14 @@ mod tests {
         let bytes = encode_vector(&vector, 2).unwrap();
         assert_eq!(decode_vector(&bytes, 2).unwrap().values, vector.values);
         assert!(decode_vector(&bytes[..4], 2).is_err());
+        let raw = [3.0_f32, 4.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            decode_vector(&raw, 2),
+            Err(EmbeddingError::CacheCorrupt(_))
+        ));
         assert!(normalize_vector(&[0.0, 0.0]).is_err());
         assert!(normalize_vector(&[f32::NAN]).is_err());
     }
@@ -598,5 +709,93 @@ mod tests {
                 .all(|request| !request.contains("/api/pull")
                     && !request.contains("/api/embeddings"))
         );
+    }
+
+    #[cfg(feature = "embeddings-ollama")]
+    #[test]
+    fn ollama_transport_rejects_http_malformed_oversized_timeout_and_missing_model() {
+        let cases = vec![
+            MockReply {
+                status: 503,
+                body: b"server detail must not escape".to_vec(),
+                delay_ms: 0,
+            },
+            MockReply {
+                status: 200,
+                body: b"not json".to_vec(),
+                delay_ms: 0,
+            },
+            MockReply {
+                status: 200,
+                body: vec![b' '; (32 * 1024 * 1024) + 1],
+                delay_ms: 0,
+            },
+            MockReply {
+                status: 200,
+                body: br#"{"models":[]}"#.to_vec(),
+                delay_ms: 0,
+            },
+        ];
+        for reply in cases {
+            let (address, _, server) = mock_server(vec![reply]);
+            let provider =
+                crate::embedding::ollama::OllamaProvider::new(&ollama_config(address)).unwrap();
+            assert!(provider.resolve_model().is_err());
+            server.join().unwrap();
+        }
+        let (address, _, server) = mock_server(vec![MockReply {
+            status: 200,
+            body: br#"{"models":[]}"#.to_vec(),
+            delay_ms: 1200,
+        }]);
+        let mut config = ollama_config(address);
+        config.request_timeout_seconds = 1;
+        let provider = crate::embedding::ollama::OllamaProvider::new(&config).unwrap();
+        assert!(provider.resolve_model().is_err());
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "embeddings-ollama")]
+    #[test]
+    fn ollama_transport_rejects_invalid_embedding_responses() {
+        let tags=br#"{"models":[{"name":"fixture:latest","model":"fixture:latest","digest":"sha256:abc"}]}"#;
+        let invalid = [
+            br#"{"model":"fixture:latest","embeddings":[]}"#.as_slice(),
+            br#"{"model":"fixture:latest","embeddings":[[1,0,0,0,0,0,0,0],[1]]}"#.as_slice(),
+            br#"{"model":"fixture:latest","embeddings":[[0,0,0,0,0,0,0,0]]}"#.as_slice(),
+            br#"{"model":"other:latest","embeddings":[[1,0,0,0,0,0,0,0]]}"#.as_slice(),
+            b"malformed".as_slice(),
+        ];
+        for body in invalid {
+            let (address, requests, server) = mock_server(vec![
+                MockReply {
+                    status: 200,
+                    body: tags.to_vec(),
+                    delay_ms: 0,
+                },
+                MockReply {
+                    status: 200,
+                    body: body.to_vec(),
+                    delay_ms: 0,
+                },
+            ]);
+            let provider =
+                crate::embedding::ollama::OllamaProvider::new(&ollama_config(address)).unwrap();
+            let model = provider.resolve_model().unwrap();
+            let inputs = [EmbeddingInput {
+                text_hash: ContentHash("blake3:x".into()),
+                text: "fixture".into(),
+            }];
+            assert!(provider.embed(&inputs, &model).is_err());
+            server.join().unwrap();
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| !request.contains("/api/pull")
+                        && !request.contains("/api/embeddings"))
+            );
+        }
     }
 }

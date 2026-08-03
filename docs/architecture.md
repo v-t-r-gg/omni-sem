@@ -37,6 +37,8 @@ Format v1 remains lexical-only: local embedding spaces, vectors, references, fai
 
 The synchronous `EmbeddingProvider` boundary contains no Ollama transport types. Lexical indexing commits first; enabled synchronization then resolves an exact model digest, derives a deterministic compatibility-space ID, links cache hits, and calls the provider outside SQLite transactions. Cache persistence and segment linking are transactional per successful batch. Provider failure cannot roll back a lexical revision. Semantic querying is deferred to Milestone 4B.
 
+Persisted cache hits are loaded, dimension-checked, decoded, and verified as already L2-normalized before linkage. Fresh provider batches are count/dimension/value validated and normalized in memory before any database mutation. Malformed batches become bounded partial failures rather than storage failures.
+
 ## Token estimation
 
 Heuristic: `ceil(char_count / 3)` plus fixed response/result overhead. Conservative, not model-exact.

@@ -10,6 +10,13 @@ All notable changes will be documented here. The format follows Keep a Changelog
 - Schema v4 digest-aware embedding spaces, normalized binary f32 cache, active-segment backfill, failure state, and bounded sync history.
 - Persisted embedding status and `omnisem doctor`; snapshot format 1 and retrieval remain lexical-only.
 
+### Fixed (Milestone 4A corrective)
+
+- Validate persisted vectors without renormalizing them and reject corrupt cache rows before segment linkage.
+- Validate complete provider batches before writes, persist malformed-output failures as partial synchronization, and clear stale active-space selection on unknown-dimension model changes.
+- Compare configured and active embedding compatibility in status and verify resolved model/digest/dimensions in doctor.
+- Add transport and synchronization fault injection for timeouts, bounded responses, malformed output, batch continuation, retry, cache corruption, source changes, and transaction boundaries.
+
 ### Added
 
 - Milestone 3 complete boundary:

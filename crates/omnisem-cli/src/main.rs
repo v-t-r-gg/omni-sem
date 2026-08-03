@@ -550,8 +550,8 @@ fn cmd_status(paths: &AppPaths, json: bool, serve: bool, port: u16) -> Result<Ex
     })?;
     if serve {
         drop(connection);
-        let server =
-            serve_status(&database_path, port).map_err(|error| print_config_err(&error))?;
+        let server = serve_status(&database_path, &config.embeddings, port)
+            .map_err(|error| print_config_err(&error))?;
         println!("Omni-Sem status listening on http://{}/", server.addr());
         println!("Read-only local view. Press Ctrl+C to stop.");
         loop {
@@ -562,6 +562,8 @@ fn cmd_status(paths: &AppPaths, json: bool, serve: bool, port: u16) -> Result<Ex
         eprintln!("error: {error}");
         ExitCode::Database
     })?;
+    let compatibility =
+        omnisem_core::storage::embedding_compatibility(&config.embeddings, &snapshot.embedding);
     let output = StatusOutput {
         config_path: paths.config_file.display().to_string(),
         database_path: database_path.display().to_string(),
@@ -578,6 +580,7 @@ fn cmd_status(paths: &AppPaths, json: bool, serve: bool, port: u16) -> Result<Ex
         database_size_bytes: snapshot.database_size_bytes,
         sensitivity_tag_count: snapshot.sensitivity_tag_count,
         embedding: snapshot.embedding,
+        embedding_compatibility: compatibility,
     };
     if json {
         print_json(&output).map_err(|error| print_config_err(&error))?;
@@ -625,6 +628,10 @@ fn cmd_status(paths: &AppPaths, json: bool, serve: bool, port: u16) -> Result<Ex
         println!(
             "embedding_coverage: {}/{}",
             output.embedding.linked_active_segments, output.embedding.active_segments
+        );
+        println!(
+            "embedding_compatibility: {}",
+            output.embedding_compatibility.state
         );
         println!(
             "last_successful_scan_ms: {}",
@@ -697,14 +704,30 @@ fn cmd_doctor(paths: &AppPaths, json: bool) -> Result<ExitCode, ExitCode> {
     );
     if config.embeddings.enabled {
         match omnisem_core::embedding::diagnose_provider(&config.embeddings) {
-            Ok(Some(model)) => checks.push(DoctorCheck::pass(
-                "embedding_provider",
-                &format!(
-                    "model {} digest {}",
-                    model.canonical_name,
-                    &model.model_digest[..model.model_digest.len().min(12)]
-                ),
-            )),
+            Ok(Some(model)) => {
+                checks.push(DoctorCheck::pass(
+                    "embedding_provider",
+                    &format!(
+                        "model {} digest {}",
+                        model.canonical_name,
+                        &model.model_digest[..model.model_digest.len().min(12)]
+                    ),
+                ));
+                let active = &snapshot.embedding;
+                let dimensions_match = model
+                    .dimensions
+                    .is_none_or(|value| active.dimensions == Some(value));
+                let compatible = active.provider.as_deref() == Some("ollama")
+                    && active.canonical_model.as_deref() == Some(model.canonical_name.as_str())
+                    && active.model_digest.as_deref() == Some(model.model_digest.as_str())
+                    && dimensions_match
+                    && active.dimensions.is_some_and(|value| value > 0);
+                checks.push(if compatible {
+                    DoctorCheck::pass("embedding_space_compatibility", "resolved provider, canonical model, digest, and dimensions agree with the active space")
+                } else {
+                    DoctorCheck::failure("embedding_space_compatibility", "resolved provider, canonical model, digest, or dimensions do not agree with the active persisted space")
+                });
+            }
             Ok(None) => checks.push(DoctorCheck::disabled(
                 "embedding_provider",
                 "embeddings are disabled",
@@ -715,6 +738,10 @@ fn cmd_doctor(paths: &AppPaths, json: bool) -> Result<ExitCode, ExitCode> {
         checks.push(DoctorCheck::disabled(
             "embedding_provider",
             "embeddings are disabled; no provider request made",
+        ));
+        checks.push(DoctorCheck::disabled(
+            "embedding_space_compatibility",
+            "embeddings are disabled",
         ));
     }
     checks.push(DoctorCheck {
@@ -1182,6 +1209,7 @@ struct StatusOutput {
     database_size_bytes: u64,
     sensitivity_tag_count: i64,
     embedding: omnisem_core::storage::EmbeddingStatus,
+    embedding_compatibility: omnisem_core::storage::EmbeddingCompatibility,
 }
 
 #[derive(Debug, Serialize)]

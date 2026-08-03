@@ -751,6 +751,54 @@ pub struct EmbeddingStatus {
     pub latest_sync_completed_at_ms: Option<i64>,
 }
 
+/// Network-free comparison of configured compatibility fields with the active space.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EmbeddingCompatibility {
+    pub configured_enabled: bool,
+    pub configured_provider: String,
+    pub configured_model: Option<String>,
+    pub configured_dimensions: Option<u32>,
+    pub state: String,
+}
+
+/// Compares fields available without resolving a mutable model tag.
+#[must_use]
+pub fn embedding_compatibility(
+    config: &crate::config::EmbeddingConfig,
+    status: &EmbeddingStatus,
+) -> EmbeddingCompatibility {
+    let provider = match config.provider {
+        crate::config::EmbeddingProviderConfig::None => "none",
+        crate::config::EmbeddingProviderConfig::Ollama => "ollama",
+    };
+    let configured_model = (!config.model.is_empty()).then(|| config.model.clone());
+    let configured_dimensions = (config.dimensions != 0).then_some(config.dimensions);
+    let canonical_candidate = if config.model.contains(':') {
+        config.model.clone()
+    } else {
+        format!("{}:latest", config.model)
+    };
+    let state = if !config.enabled {
+        "disabled"
+    } else if !status.space_exists {
+        "missing_active_space"
+    } else if status.provider.as_deref() != Some(provider)
+        || status.canonical_model.as_deref() != Some(canonical_candidate.as_str())
+        || configured_dimensions.is_some_and(|value| status.dimensions != Some(value))
+    {
+        "incompatible"
+    } else {
+        "compatible_requires_digest_resolution"
+    };
+    EmbeddingCompatibility {
+        configured_enabled: config.enabled,
+        configured_provider: provider.into(),
+        configured_model,
+        configured_dimensions,
+        state: state.into(),
+    }
+}
+
 /// Collects operational status counters.
 ///
 /// # Errors
@@ -1117,5 +1165,37 @@ mod tests {
         let path = temp.path().join("index.sqlite3");
         open_database(&path).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn configured_active_space_compatibility_is_explicit_without_network() {
+        let mut config = crate::config::EmbeddingConfig::default();
+        let empty = EmbeddingStatus::default();
+        assert_eq!(embedding_compatibility(&config, &empty).state, "disabled");
+        config.enabled = true;
+        config.provider = crate::config::EmbeddingProviderConfig::Ollama;
+        config.endpoint = "http://localhost:11434".into();
+        config.model = "fixture".into();
+        config.dimensions = 8;
+        assert_eq!(
+            embedding_compatibility(&config, &empty).state,
+            "missing_active_space"
+        );
+        let active = EmbeddingStatus {
+            space_exists: true,
+            provider: Some("ollama".into()),
+            canonical_model: Some("fixture:latest".into()),
+            dimensions: Some(8),
+            ..EmbeddingStatus::default()
+        };
+        assert_eq!(
+            embedding_compatibility(&config, &active).state,
+            "compatible_requires_digest_resolution"
+        );
+        config.dimensions = 16;
+        assert_eq!(
+            embedding_compatibility(&config, &active).state,
+            "incompatible"
+        );
     }
 }

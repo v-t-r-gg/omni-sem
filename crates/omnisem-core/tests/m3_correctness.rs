@@ -488,13 +488,14 @@ fn status_http_methods_and_snapshot_health() {
     import_snapshot(&mut connection, &dest, &[(root_id.clone(), root_id)]).unwrap();
     drop(connection);
 
-    let server = serve_status(&db, 0).unwrap();
+    let server = serve_status(&db, &config.embeddings, 0).unwrap();
     let addr = server.addr();
     assert!(addr.ip().is_loopback());
 
     let get = request(addr, "GET /status.json HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert!(get.contains("200 OK"));
     assert!(get.contains("\"registered\""));
+    assert!(get.contains("embedding_compatibility"));
     assert!(get.contains("X-Content-Type-Options: nosniff"));
     assert!(get.contains("X-Frame-Options: DENY"));
     assert!(get.contains("Content-Security-Policy"));
