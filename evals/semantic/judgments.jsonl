@@ -1,0 +1,2 @@
+{"query_id":"offline-database","required":["local-storage#heading:decision"],"acceptable":[],"misleading":["remote-storage#heading:proposal"],"expected_source_diversity":1}
+{"query_id":"combined-ranking","required":["fusion-note#heading:ranking"],"acceptable":[],"misleading":[],"expected_source_diversity":1}

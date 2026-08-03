@@ -8,8 +8,11 @@ use omnisem_core::config::{AppConfig, add_root, init_installation, remove_root};
 use omnisem_core::domain::{
     RetrievalMode, RetrievalQuery, RootId, SupportedFileType, Timestamp, parse_duration_to_millis,
 };
+use omnisem_core::embedding::configured_provider;
 use omnisem_core::error::{ConfigError, ExitCode, IndexError, RetrievalError};
-use omnisem_core::eval::run_evaluation;
+use omnisem_core::eval::{
+    compare_evaluation_with_provider, run_evaluation, run_evaluation_with_provider,
+};
 use omnisem_core::index::{IndexOptions, IndexReport, index_roots_with_options};
 use omnisem_core::paths::AppPaths;
 use omnisem_core::retrieval::{resolve_budget_args, retrieve};
@@ -119,6 +122,9 @@ enum Command {
         corpus: Option<PathBuf>,
         #[arg(long, default_value = "lexical")]
         mode: String,
+        /// Compare lexical, semantic, and hybrid over the evaluation bundle.
+        #[arg(long)]
+        compare: bool,
         #[arg(long)]
         json: bool,
     },
@@ -240,7 +246,12 @@ fn run() -> Result<ExitCode, ExitCode> {
             explain,
             json,
         ),
-        Some(Command::Eval { corpus, mode, json }) => cmd_eval(corpus.as_deref(), &mode, json),
+        Some(Command::Eval {
+            corpus,
+            mode,
+            compare,
+            json,
+        }) => cmd_eval(&paths, corpus.as_deref(), &mode, compare, json),
     }
 }
 
@@ -913,7 +924,7 @@ fn cmd_query(
     );
     if json {
         print_json(&QueryEnvelope {
-            schema_version: 1,
+            schema_version: 2,
             response,
         })
         .map_err(|error| print_config_err(&error))?;
@@ -944,6 +955,16 @@ fn cmd_query(
                 hit.token_estimate,
                 origin
             );
+            println!("   score_kind={}", response.score_kind);
+            if let Some(raw) = hit.signals.raw_bm25 {
+                println!("   raw_bm25={raw:.6}");
+            }
+            if let Some(cosine) = hit.signals.cosine_similarity {
+                println!("   cosine_similarity={cosine:.6}");
+            }
+            if let Some(fusion) = hit.signals.fusion_score {
+                println!("   fusion_score={fusion:.6}");
+            }
             println!("   revision={}", hit.revision_id);
             if let Some(scope) = hit.sensitivity_scope {
                 println!("   sensitivity={}", scope.as_str());
@@ -960,7 +981,8 @@ fn cmd_query(
             }
         }
         println!(
-            "mode={} results={} tokens={} duplicates_suppressed={} truncated={} elapsed_ms={}",
+            "requested_mode={} mode={} results={} tokens={} duplicates_suppressed={} truncated={} elapsed_ms={}",
+            response.requested_mode.as_str(),
             response.mode.as_str(),
             response.results.len(),
             response.token_estimate,
@@ -972,7 +994,13 @@ fn cmd_query(
     Ok(ExitCode::Success)
 }
 
-fn cmd_eval(corpus: Option<&Path>, mode: &str, json: bool) -> Result<ExitCode, ExitCode> {
+fn cmd_eval(
+    paths: &AppPaths,
+    corpus: Option<&Path>,
+    mode: &str,
+    compare: bool,
+    json: bool,
+) -> Result<ExitCode, ExitCode> {
     let mode = mode.parse::<RetrievalMode>().map_err(|error| {
         eprintln!("error: {error}");
         ExitCode::InvalidInput
@@ -987,36 +1015,63 @@ fn cmd_eval(corpus: Option<&Path>, mode: &str, json: bool) -> Result<ExitCode, E
             PathBuf::from("evals")
         }
     };
+    if compare || mode != RetrievalMode::Lexical {
+        let config = load_or_init(paths).map_err(|error| print_config_err(&error))?;
+        let provider = configured_provider(&config.embeddings).map_err(|error| {
+            eprintln!("error: {error}");
+            ExitCode::Protocol
+        })?;
+        if compare {
+            let report =
+                compare_evaluation_with_provider(&bundle, &config.embeddings, provider.as_ref())
+                    .map_err(|error| print_retrieval_err(&error))?;
+            print_json(&report).map_err(|error| print_config_err(&error))?;
+            return Ok(ExitCode::Success);
+        }
+        let report =
+            run_evaluation_with_provider(&bundle, mode, &config.embeddings, provider.as_ref())
+                .map_err(|error| print_retrieval_err(&error))?;
+        if json {
+            print_json(&report).map_err(|error| print_config_err(&error))?;
+        } else {
+            print_eval_report(&report);
+        }
+        return Ok(ExitCode::Success);
+    }
     let report = run_evaluation(&bundle, mode).map_err(|error| print_retrieval_err(&error))?;
     if json {
         print_json(&report).map_err(|error| print_config_err(&error))?;
     } else {
-        println!("run_id={}", report.run_id);
-        println!(
-            "mode={} corpus={} queries={}",
-            report.mode, report.corpus_size, report.query_count
-        );
-        println!(
-            "recall@5={:.3} recall@10={:.3} mrr={:.3} ndcg={:.3}",
-            report.metrics.recall_at_5,
-            report.metrics.recall_at_10,
-            report.metrics.mrr,
-            report.metrics.ndcg
-        );
-        println!(
-            "dup={:.3} stale={:.3} misleading={:.3} diversity={:.3} tokens={:.1}",
-            report.metrics.duplicate_result_rate,
-            report.metrics.stale_result_rate,
-            report.metrics.misleading_result_rate,
-            report.metrics.source_diversity,
-            report.metrics.returned_tokens
-        );
-        println!(
-            "p50_ms={:.2} p95_ms={:.2}",
-            report.metrics.p50_latency_ms, report.metrics.p95_latency_ms
-        );
+        print_eval_report(&report);
     }
     Ok(ExitCode::Success)
+}
+
+fn print_eval_report(report: &omnisem_core::eval::EvalReport) {
+    println!("run_id={}", report.run_id);
+    println!(
+        "mode={} corpus={} queries={}",
+        report.mode, report.corpus_size, report.query_count
+    );
+    println!(
+        "recall@5={:.3} recall@10={:.3} mrr={:.3} ndcg={:.3}",
+        report.metrics.recall_at_5,
+        report.metrics.recall_at_10,
+        report.metrics.mrr,
+        report.metrics.ndcg
+    );
+    println!(
+        "dup={:.3} stale={:.3} misleading={:.3} diversity={:.3} tokens={:.1}",
+        report.metrics.duplicate_result_rate,
+        report.metrics.stale_result_rate,
+        report.metrics.misleading_result_rate,
+        report.metrics.source_diversity,
+        report.metrics.returned_tokens
+    );
+    println!(
+        "p50_ms={:.2} p95_ms={:.2}",
+        report.metrics.p50_latency_ms, report.metrics.p95_latency_ms
+    );
 }
 
 #[allow(clippy::too_many_lines)]

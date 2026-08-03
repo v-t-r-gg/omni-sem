@@ -1,0 +1,3 @@
+{"document_id":"local-storage","path":"storage.md","revision":"current","segments":[{"anchor":"heading:decision","text":"The durable record lives in an embedded SQLite database on the user's machine."}]}
+{"document_id":"remote-storage","path":"archive/remote.md","revision":"stale","segments":[{"anchor":"heading:proposal","text":"A hosted graph service was once proposed as the authoritative store."}]}
+{"document_id":"fusion-note","path":"meeting.md","revision":"current","segments":[{"anchor":"heading:ranking","text":"Hybrid ranking combines exact words with meaning-based neighbors."}]}
