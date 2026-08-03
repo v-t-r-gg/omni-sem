@@ -50,3 +50,8 @@ Heuristic: `ceil(char_count / 3)` plus fixed response/result overhead. Conservat
 ## Security
 
 Active revisions only, approved roots only, relative paths in results, safe FTS construction, no source logging, sensitivity filtering before packing, isolated evaluation databases. Incremental indexing shares discovery validation. Status HTTP is loopback-only, method-aware, and omits source/query text.
+## Milestone 4B retrieval runtime
+
+The production `retrieve` wrapper preserves a provider-free lexical path. Semantic-capable calls construct only the explicitly configured provider and invoke `retrieve_with_runtime`, whose provider and `VectorSearch` boundaries are injectable for deterministic tests. Model resolution and query embedding are synchronous and occur without an open SQLite transaction. Query vectors exist only on the stack/heap for one invocation.
+
+The schema-v4 exact scanner joins segment references to current revisions, active files, and enabled roots, then applies request and sensitivity filters before ranking. Hybrid fusion accepts local lexical, per-snapshot lexical, and local semantic ranked lists in one RRF pass.

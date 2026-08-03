@@ -34,3 +34,4 @@ Active-only sanitized tables: logical roots, relative source paths, revisions, s
 ## Sensitivity
 
 Snapshots contain derived segment text. Treat like index data: encrypt at rest if needed, do not publish publicly, delete with `omnisem snapshot remove`.
+Snapshot format 1 contains no vectors. It contributes lexical lists to hybrid RRF, never semantic candidates; portable semantic evidence requires a future snapshot version.

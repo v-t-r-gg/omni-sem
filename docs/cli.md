@@ -125,3 +125,10 @@ After resolution, doctor requires the active persisted provider, canonical model
 ### Query provenance
 
 JSON hits include `origin` (`local_index` or `snapshot` with ids). Human output marks snapshot results. Federation uses RRF when snapshots contribute; local BM25 path is unchanged when no snapshots are eligible.
+### Query modes
+
+`omnisem query TEXT --mode lexical|semantic|hybrid|auto` reports requested and effective modes. Lexical is network-inert. Semantic requires a compatible active local embedding space. Hybrid requires that semantic channel and fuses local FTS, eligible snapshot FTS lists, and local vector results once with RRF. Auto uses lexical when embeddings are disabled or unavailable and emits a bounded warning; after embeddings are explicitly enabled it may contact the configured provider.
+
+The query JSON envelope is version 2 and includes `requested_mode`, effective `mode`, `score_kind`, lexical/semantic ranks, cosine similarity, fusion score, and embedding-space ID when applicable.
+
+`omnisem eval --mode lexical|semantic|hybrid` runs an isolated evaluation. `omnisem eval --compare` produces all three reports and deltas. Semantic-capable evaluation requires explicit enabled embedding configuration.

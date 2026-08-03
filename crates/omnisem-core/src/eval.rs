@@ -167,6 +167,9 @@ pub fn run_evaluation(
 }
 
 /// Runs semantic-capable evaluation in an isolated installation with an injected provider.
+///
+/// # Errors
+/// Returns bundle, indexing, provider, compatibility, or retrieval failures.
 pub fn run_evaluation_with_provider(
     bundle_dir: &Path,
     mode: RetrievalMode,
@@ -177,6 +180,9 @@ pub fn run_evaluation_with_provider(
 }
 
 /// Compares all retrieval modes with deterministic provider wiring.
+///
+/// # Errors
+/// Returns when any isolated mode run cannot be completed.
 pub fn compare_evaluation_with_provider(
     bundle_dir: &Path,
     embedding: &EmbeddingConfig,

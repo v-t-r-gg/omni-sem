@@ -3348,3 +3348,4 @@ Markdown files
 ```
 
 Semantic vectors, continuous watching, code and PDF parsing, entity resolution, and graph traversal will be added only when each layer demonstrates measurable value.
+> Implementation note (Milestone 4B): semantic and hybrid retrieval use transient query embeddings, exact bounded active-vector search, and one-pass RRF. Snapshot format 1 remains lexical-only.

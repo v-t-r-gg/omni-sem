@@ -1,6 +1,6 @@
 # Retrieval evaluation
 
-Milestone 4A does not add semantic evaluation. Evaluation remains lexical-only; lexical/semantic/hybrid comparison is deferred with query-vector generation and vector ranking to Milestone 4B.
+Milestone 4B supports isolated lexical, semantic, hybrid, and comparison evaluation. Semantic-capable runs copy only the explicit embedding configuration into a temporary installation, materialize the fixture corpus and its vectors there, and never use the user's roots, snapshots, or database. Lexical evaluation constructs no provider.
 
 ## Bundle layout
 
@@ -10,6 +10,7 @@ evals/
   queries.jsonl
   judgments.jsonl
   schema/
+  semantic/
 ```
 
 ## Relevance grades
@@ -54,6 +55,8 @@ Row UUIDs are omitted so equivalent corpora fingerprint identically across re-in
 ## Isolation
 
 Evaluation always builds a temporary data root and database. The user’s configured index is never modified. Imported snapshots are **not** part of the default evaluation path; reference lexical metrics remain local-only unless a bundle explicitly includes snapshots.
+
+`omnisem eval --compare` reports lexical, semantic, and hybrid metrics plus semantic-minus-lexical and hybrid-minus-lexical deltas. Results depend on corpus and exact model digest; the report does not assert that one mode is intrinsically superior. Provider/model cold start and corpus materialization are excluded from per-query latency and reported separately as corpus embedding time.
 
 ## Snapshot federation (runtime query, not default eval)
 

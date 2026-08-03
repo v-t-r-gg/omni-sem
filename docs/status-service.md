@@ -50,3 +50,4 @@ No permissive CORS.
 ## Snapshot health
 
 Status JSON includes registered, queryable, unhealthy payload counts, and mapped/unmapped root totals from the snapshot registry.
+The status service remains persisted-state-only and provider-inert. Retrieval requested/effective modes and query vectors are not retained or exposed by the service.

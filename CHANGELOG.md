@@ -43,3 +43,9 @@ All notable changes will be documented here. The format follows Keep a Changelog
 ### Previously
 
 - Milestone 1 operational indexing and Milestone 2 lexical retrieval/evaluation.
+## Unreleased
+
+- Add transient query embeddings with strict digest-aware active-space verification.
+- Add bounded exact cosine search over active local vectors and semantic explanations.
+- Add semantic, hybrid, and auto retrieval with one-pass lexical/snapshot/vector RRF.
+- Add isolated semantic/hybrid evaluation and comparative metric deltas.
