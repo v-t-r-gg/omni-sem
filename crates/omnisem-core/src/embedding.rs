@@ -18,6 +18,26 @@ use crate::hash::blake3_hex;
 
 /// Versioned text-to-provider input contract.
 pub const EMBEDDING_INPUT_CONTRACT_VERSION: &str = "segment-text-v1";
+/// Versioned contract for transient query text sent to an embedding provider.
+pub const QUERY_EMBEDDING_INPUT_CONTRACT_VERSION: &str = "query-text-v1";
+
+/// Constructs the explicitly configured production provider.
+pub fn configured_provider(
+    config: &EmbeddingConfig,
+) -> Result<Box<dyn EmbeddingProvider>, EmbeddingError> {
+    if !config.enabled {
+        return Err(EmbeddingError::Unavailable);
+    }
+    #[cfg(feature = "embeddings-ollama")]
+    {
+        Ok(Box::new(ollama::OllamaProvider::new(config)?))
+    }
+    #[cfg(not(feature = "embeddings-ollama"))]
+    {
+        let _ = config;
+        Err(EmbeddingError::FeatureDisabled)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

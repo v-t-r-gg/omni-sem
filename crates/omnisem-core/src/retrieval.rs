@@ -17,6 +17,10 @@ use crate::domain::{
     RetrievalMode, RetrievalQuery, RetrievalResponse, RetrievalSignals, RevisionId, RootId,
     SegmentId, SensitivityScope, SourceFileId, SupportedFileType, Timestamp, TokenBudget,
 };
+use crate::embedding::{
+    EmbeddingInput, EmbeddingProvider, EmbeddingSpace, EmbeddingVector, configured_provider,
+    normalize_vector,
+};
 use crate::error::RetrievalError;
 use crate::freshness::inspect_freshness;
 use crate::query_parse::{ParsedQuery, parse_lexical_query};
@@ -30,6 +34,44 @@ use crate::tokens::{
 pub const MAX_CANDIDATES: usize = 200;
 /// Multiplier of the final limit used when fetching candidates.
 pub const CANDIDATE_MULTIPLIER: usize = 8;
+/// Maximum active vectors examined by the exact baseline.
+pub const MAX_ACTIVE_VECTORS: usize = 50_000;
+/// Maximum semantic candidates retained before packing or fusion.
+pub const MAX_SEMANTIC_CANDIDATES: usize = 200;
+/// Maximum candidates admitted to a single fusion pass.
+pub const MAX_FUSION_CANDIDATES: usize = 768;
+
+/// Provider-independent synchronous exact-vector boundary.
+pub trait VectorSearch: Send + Sync {
+    /// Searches compatible active vectors.
+    ///
+    /// # Errors
+    /// Returns a typed retrieval failure for storage corruption or safety-bound violations.
+    fn search(
+        &self,
+        connection: &Connection,
+        config: &AppConfig,
+        space: &EmbeddingSpace,
+        query: &EmbeddingVector,
+        filters: &RetrievalQuery,
+        limit: usize,
+    ) -> Result<VectorSearchReport, RetrievalError>;
+}
+
+#[derive(Debug)]
+pub struct VectorSearchReport {
+    pub hits: Vec<RetrievalHit>,
+    pub examined: u32,
+    pub corrupt_excluded: u32,
+}
+
+/// Injectable runtime used by deterministic tests and production transport.
+pub struct RetrievalRuntime<'a> {
+    pub embedding_provider: Option<&'a dyn EmbeddingProvider>,
+    pub vector_search: &'a dyn VectorSearch,
+}
+
+pub struct SqliteExactVectorSearch;
 
 #[derive(Debug, Clone)]
 struct RawCandidate {
@@ -48,6 +90,160 @@ struct RawCandidate {
     highlighted: String,
 }
 
+impl VectorSearch for SqliteExactVectorSearch {
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    fn search(
+        &self,
+        connection: &Connection,
+        config: &AppConfig,
+        space: &EmbeddingSpace,
+        query: &EmbeddingVector,
+        filters: &RetrievalQuery,
+        limit: usize,
+    ) -> Result<VectorSearchReport, RetrievalError> {
+        let eligible: u64 = connection.query_row(
+            "SELECT count(*) FROM segment_embeddings se JOIN segments s ON s.id=se.segment_id JOIN source_files sf ON sf.current_revision_id=s.revision_id AND sf.state='active' JOIN roots r ON r.id=sf.root_id AND r.enabled=1 WHERE se.embedding_space_id=?1",
+            [&space.id], |row| row.get(0)).map_err(StorageError::from)?;
+        if eligible > MAX_ACTIVE_VECTORS as u64 {
+            return Err(semantic_error(
+                "VECTOR_SCAN_LIMIT_EXCEEDED",
+                "eligible active-vector count exceeds the exact-scan safety bound",
+            ));
+        }
+        let sensitivity = load_sensitivity_sets(config);
+        let mut statement = connection.prepare(
+            "SELECT s.id,s.revision_id,sf.id,sf.root_id,sf.relative_path,sf.file_type,s.anchor,s.text,s.text_hash,r.canonical_path,sf.modified_at_ms,ev.vector_bytes,ev.dimensions FROM segment_embeddings se JOIN embedding_vectors ev ON ev.embedding_space_id=se.embedding_space_id AND ev.text_hash=se.text_hash JOIN segments s ON s.id=se.segment_id AND s.revision_id=se.revision_id JOIN source_files sf ON sf.current_revision_id=s.revision_id AND sf.state='active' JOIN roots r ON r.id=sf.root_id AND r.enabled=1 WHERE se.embedding_space_id=?1 ORDER BY sf.relative_path,s.anchor,s.id"
+        ).map_err(StorageError::from)?;
+        let mut rows = statement.query([&space.id]).map_err(StorageError::from)?;
+        let mut scored: Vec<(f64, RetrievalHit)> = Vec::new();
+        let mut examined = 0u32;
+        let mut corrupt = 0u32;
+        while let Some(row) = rows.next().map_err(StorageError::from)? {
+            let root_id = RootId::from_str(&row.get::<_, String>(3).map_err(StorageError::from)?)
+                .map_err(|e| RetrievalError::Internal(e.to_string()))?;
+            let relative_path = PathBuf::from(row.get::<_, String>(4).map_err(StorageError::from)?);
+            let file_type =
+                SupportedFileType::from_str(&row.get::<_, String>(5).map_err(StorageError::from)?)
+                    .map_err(|e| RetrievalError::Internal(e.to_string()))?;
+            if (!filters.root_ids.is_empty() && !filters.root_ids.contains(&root_id))
+                || (!filters.file_types.is_empty() && !filters.file_types.contains(&file_type))
+            {
+                continue;
+            }
+            let scope = sensitivity_for_path(&sensitivity, &root_id, &relative_path);
+            if scope == Some(SensitivityScope::RequireExplicitQuery) && !filters.include_sensitive {
+                continue;
+            }
+            examined = examined.saturating_add(1);
+            let dimensions = row.get::<_, u32>(12).map_err(StorageError::from)?;
+            let bytes = row.get::<_, Vec<u8>>(11).map_err(StorageError::from)?;
+            if dimensions != space.dimensions {
+                corrupt = corrupt.saturating_add(1);
+                continue;
+            }
+            let Ok(candidate) = crate::embedding::decode_vector(&bytes, dimensions) else {
+                corrupt = corrupt.saturating_add(1);
+                continue;
+            };
+            let similarity = query
+                .values
+                .iter()
+                .zip(&candidate.values)
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .sum::<f64>();
+            if !similarity.is_finite() {
+                corrupt = corrupt.saturating_add(1);
+                continue;
+            }
+            let similarity = similarity.clamp(-1.0, 1.0);
+            let text: String = row.get(7).map_err(StorageError::from)?;
+            let (text, truncated) = truncate_utf8(&text, MAX_HIT_TEXT_BYTES);
+            let token_estimate =
+                u32::try_from(RESULT_OVERHEAD_TOKENS + HeuristicTokenEstimator.estimate(&text))
+                    .unwrap_or(u32::MAX);
+            let segment_id =
+                SegmentId::from_str(&row.get::<_, String>(0).map_err(StorageError::from)?)
+                    .map_err(|e| RetrievalError::Internal(e.to_string()))?;
+            let anchor: String = row.get(6).map_err(StorageError::from)?;
+            scored.push((
+                similarity,
+                RetrievalHit {
+                    segment_id,
+                    revision_id: RevisionId::from_str(
+                        &row.get::<_, String>(1).map_err(StorageError::from)?,
+                    )
+                    .map_err(|e| RetrievalError::Internal(e.to_string()))?,
+                    source_file_id: SourceFileId::from_str(
+                        &row.get::<_, String>(2).map_err(StorageError::from)?,
+                    )
+                    .map_err(|e| RetrievalError::Internal(e.to_string()))?,
+                    root_id,
+                    relative_path,
+                    file_type,
+                    anchor,
+                    text,
+                    text_hash: ContentHash(row.get(8).map_err(StorageError::from)?),
+                    score: similarity as f32,
+                    signals: RetrievalSignals {
+                        channel: "local_semantic".into(),
+                        raw_bm25: None,
+                        public_score: similarity as f32,
+                        federation_score: None,
+                        lexical_rank: None,
+                        semantic_rank: None,
+                        cosine_similarity: Some(similarity as f32),
+                        fusion_score: None,
+                        embedding_space_id: Some(space.id.clone()),
+                    },
+                    explanation: MatchExplanation {
+                        matched_terms: Vec::new(),
+                        matched_excerpt: None,
+                        explanation_kind: ExplanationKind::SemanticNeighbor,
+                    },
+                    freshness: inspect_freshness(
+                        Path::new(&row.get::<_, String>(9).map_err(StorageError::from)?),
+                        &PathBuf::from(row.get::<_, String>(4).map_err(StorageError::from)?),
+                        row.get::<_, Option<i64>>(10)
+                            .map_err(StorageError::from)?
+                            .map(Timestamp::from_millis),
+                    ),
+                    sensitivity_scope: scope,
+                    token_estimate,
+                    truncated,
+                    origin: EvidenceOrigin::LocalIndex,
+                },
+            ));
+        }
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.relative_path.cmp(&b.1.relative_path))
+                .then_with(|| a.1.anchor.cmp(&b.1.anchor))
+                .then_with(|| a.1.segment_id.to_string().cmp(&b.1.segment_id.to_string()))
+        });
+        scored.truncate(limit.min(MAX_SEMANTIC_CANDIDATES));
+        let hits: Vec<RetrievalHit> = scored
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (_, mut hit))| {
+                hit.signals.semantic_rank = Some(u32::try_from(rank + 1).unwrap_or(u32::MAX));
+                hit
+            })
+            .collect();
+        if hits.is_empty() && corrupt > 0 {
+            return Err(semantic_error(
+                "VECTOR_SEARCH_FAILED",
+                "no valid semantic candidates remained after corrupt-vector exclusion",
+            ));
+        }
+        Ok(VectorSearchReport {
+            hits,
+            examined,
+            corrupt_excluded: corrupt,
+        })
+    }
+}
+
 /// Executes lexical retrieval for a validated query against the open index.
 ///
 /// # Errors
@@ -58,15 +254,121 @@ pub fn retrieve(
     config: &AppConfig,
     request: &RetrievalQuery,
 ) -> Result<RetrievalResponse, RetrievalError> {
+    if request.mode == RetrievalMode::Lexical
+        || (request.mode == RetrievalMode::Auto && !config.embeddings.enabled)
+    {
+        return retrieve_lexical(
+            connection,
+            config,
+            request,
+            request.mode,
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+    let scanner = SqliteExactVectorSearch;
+    match configured_provider(&config.embeddings) {
+        Ok(provider) => retrieve_with_runtime(
+            connection,
+            config,
+            request,
+            &RetrievalRuntime {
+                embedding_provider: Some(provider.as_ref()),
+                vector_search: &scanner,
+            },
+        ),
+        Err(error) if request.mode == RetrievalMode::Auto => retrieve_lexical(
+            connection,
+            config,
+            request,
+            request.mode,
+            Vec::new(),
+            vec![bounded_warning(
+                "semantic channel unavailable",
+                &error.to_string(),
+            )],
+        ),
+        Err(error) => Err(semantic_error(error.code(), &error.to_string())),
+    }
+}
+
+/// Executes retrieval with injected provider and vector-search implementations.
+///
+/// # Errors
+/// Returns typed validation, provider, compatibility, vector-search, or storage failures.
+pub fn retrieve_with_runtime(
+    connection: &Connection,
+    config: &AppConfig,
+    request: &RetrievalQuery,
+    runtime: &RetrievalRuntime<'_>,
+) -> Result<RetrievalResponse, RetrievalError> {
+    match request.mode {
+        RetrievalMode::Lexical => retrieve_lexical(
+            connection,
+            config,
+            request,
+            request.mode,
+            Vec::new(),
+            Vec::new(),
+        ),
+        RetrievalMode::Semantic => semantic_response(connection, config, request, runtime),
+        RetrievalMode::Hybrid => {
+            let semantic = semantic_hits(connection, config, request, runtime)?;
+            retrieve_lexical(
+                connection,
+                config,
+                request,
+                request.mode,
+                semantic.hits,
+                semantic.warnings,
+            )
+        }
+        RetrievalMode::Auto => match semantic_hits(connection, config, request, runtime) {
+            Ok(semantic) => retrieve_lexical(
+                connection,
+                config,
+                request,
+                request.mode,
+                semantic.hits,
+                semantic.warnings,
+            ),
+            Err(error) => retrieve_lexical(
+                connection,
+                config,
+                request,
+                request.mode,
+                Vec::new(),
+                vec![bounded_warning(
+                    "semantic channel unavailable; using lexical",
+                    &error.to_string(),
+                )],
+            ),
+        },
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn retrieve_lexical(
+    connection: &Connection,
+    config: &AppConfig,
+    request: &RetrievalQuery,
+    requested_mode: RetrievalMode,
+    semantic_hits: Vec<RetrievalHit>,
+    mut initial_warnings: Vec<String>,
+) -> Result<RetrievalResponse, RetrievalError> {
     let started = Instant::now();
-    let effective_mode = resolve_mode(request.mode)?;
+    let effective_mode = if semantic_hits.is_empty() {
+        RetrievalMode::Lexical
+    } else {
+        RetrievalMode::Hybrid
+    };
     let parsed = parse_lexical_query(&request.query)?;
     let estimator = HeuristicTokenEstimator;
 
     let candidate_limit =
         (usize::from(request.limit.get()) * CANDIDATE_MULTIPLIER).clamp(1, MAX_CANDIDATES);
     let mut candidates = search_fts(connection, request, &parsed, candidate_limit)?;
-    let mut warnings = Vec::new();
+    let mut warnings = std::mem::take(&mut initial_warnings);
 
     let before_dedupe = candidates.len();
     candidates = suppress_duplicates(candidates);
@@ -107,6 +409,11 @@ pub fn retrieve(
                 raw_bm25: Some(candidate.raw_bm25),
                 public_score,
                 federation_score: None,
+                lexical_rank: None,
+                semantic_rank: None,
+                cosine_similarity: None,
+                fusion_score: None,
+                embedding_space_id: None,
             },
             explanation: MatchExplanation {
                 matched_terms,
@@ -130,6 +437,7 @@ pub fn retrieve(
         hits,
         &sensitivity,
         &mut warnings,
+        semantic_hits,
     );
 
     let packed = pack_results(
@@ -154,7 +462,15 @@ pub fn retrieve(
 
     Ok(RetrievalResponse {
         query: request.query.clone(),
+        requested_mode,
         mode: effective_mode,
+        score_kind:
+            if effective_mode == RetrievalMode::Hybrid || hits_use_fusion(&packed.results) {
+                "rrf"
+            } else {
+                "bm25_public"
+            }
+            .into(),
         results: packed.results,
         token_estimate,
         truncated: packed.truncated,
@@ -167,18 +483,218 @@ pub fn retrieve(
     })
 }
 
-fn resolve_mode(mode: RetrievalMode) -> Result<RetrievalMode, RetrievalError> {
-    match mode {
-        RetrievalMode::Lexical | RetrievalMode::Auto => Ok(RetrievalMode::Lexical),
-        RetrievalMode::Semantic => Err(mode_unavailable("semantic")),
-        RetrievalMode::Hybrid => Err(mode_unavailable("hybrid")),
+fn hits_use_fusion(hits: &[RetrievalHit]) -> bool {
+    hits.iter().any(|hit| hit.signals.fusion_score.is_some())
+}
+fn semantic_error(code: &'static str, message: &str) -> RetrievalError {
+    RetrievalError::Semantic {
+        code,
+        message: message.chars().take(240).collect(),
     }
 }
+fn bounded_warning(prefix: &str, message: &str) -> String {
+    format!(
+        "{prefix}: {}",
+        message.chars().take(180).collect::<String>()
+    )
+}
 
-fn mode_unavailable(name: &str) -> RetrievalError {
-    RetrievalError::Domain(crate::domain::DomainError::RetrievalModeUnavailable(
-        name.into(),
+struct SemanticChannel {
+    hits: Vec<RetrievalHit>,
+    warnings: Vec<String>,
+}
+
+fn validate_query_text(query: &str) -> Result<&str, RetrievalError> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err(semantic_error("QUERY_INVALID", "query is empty"));
+    }
+    if trimmed.chars().count() > crate::query_parse::MAX_QUERY_CHARS {
+        return Err(semantic_error(
+            "QUERY_INVALID",
+            "query exceeds the configured character bound",
+        ));
+    }
+    if trimmed
+        .chars()
+        .filter(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+        .count()
+        > 8
+    {
+        return Err(semantic_error(
+            "QUERY_INVALID",
+            "query contains too many control characters",
+        ));
+    }
+    Ok(trimmed)
+}
+
+fn load_active_space(connection: &Connection) -> Result<EmbeddingSpace, RetrievalError> {
+    let row = connection.query_row(
+        "SELECT es.id,es.provider,es.canonical_model,es.model_digest,es.dimensions,es.normalization,es.input_contract_version FROM embedding_state st JOIN embedding_spaces es ON es.id=st.active_embedding_space_id WHERE st.singleton=1",
+        [],
+        |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,u32>(4)?,row.get::<_,String>(5)?,row.get::<_,String>(6)?)),
+    ).map_err(|error| match error {
+        rusqlite::Error::QueryReturnedNoRows => semantic_error("EMBEDDING_SPACE_MISSING", "no active embedding space; run omnisem index"),
+        other => RetrievalError::Storage(StorageError::from(other)),
+    })?;
+    if row.1 != "ollama"
+        || row.5 != "l2"
+        || row.6 != crate::embedding::EMBEDDING_INPUT_CONTRACT_VERSION
+    {
+        return Err(semantic_error(
+            "EMBEDDING_SPACE_INCOMPATIBLE",
+            "active embedding-space contract is unsupported",
+        ));
+    }
+    Ok(EmbeddingSpace {
+        id: row.0,
+        provider: crate::embedding::EmbeddingProviderKind::Ollama,
+        canonical_model: row.2,
+        model_digest: row.3,
+        dimensions: row.4,
+        normalization: crate::embedding::VectorNormalization::L2,
+        input_contract_version: row.6,
+    })
+}
+
+fn semantic_hits(
+    connection: &Connection,
+    config: &AppConfig,
+    request: &RetrievalQuery,
+    runtime: &RetrievalRuntime<'_>,
+) -> Result<SemanticChannel, RetrievalError> {
+    let query = validate_query_text(&request.query)?;
+    let provider = runtime.embedding_provider.ok_or_else(|| {
+        semantic_error("SEMANTIC_UNAVAILABLE", "embedding provider is unavailable")
+    })?;
+    let space = load_active_space(connection)?;
+    if provider.provider_kind() != space.provider {
+        return Err(semantic_error(
+            "EMBEDDING_SPACE_INCOMPATIBLE",
+            "configured provider differs from active space",
+        ));
+    }
+    let linked: u32 = connection.query_row(
+        "SELECT count(*) FROM segment_embeddings se JOIN segments s ON s.id=se.segment_id JOIN source_files sf ON sf.current_revision_id=s.revision_id AND sf.state='active' JOIN roots r ON r.id=sf.root_id AND r.enabled=1 WHERE se.embedding_space_id=?1",
+        [&space.id], |row| row.get(0)).map_err(StorageError::from)?;
+    if linked == 0 {
+        return Err(semantic_error(
+            "SEMANTIC_UNAVAILABLE",
+            "active embedding space has no linked active segments; run omnisem index",
+        ));
+    }
+    // Resolution and embedding occur with no SQLite transaction or statement alive.
+    let model = provider
+        .resolve_model()
+        .map_err(|error| semantic_error(error.code(), &error.to_string()))?;
+    if model.provider != space.provider || model.canonical_name != space.canonical_model {
+        return Err(semantic_error(
+            "EMBEDDING_SPACE_INCOMPATIBLE",
+            "resolved model identity differs from active space; run omnisem index",
+        ));
+    }
+    if model.model_digest != space.model_digest {
+        return Err(semantic_error(
+            "EMBEDDING_MODEL_CHANGED",
+            "configured model digest changed; run omnisem index",
+        ));
+    }
+    if model
+        .dimensions
+        .is_some_and(|dimensions| dimensions != space.dimensions)
+    {
+        return Err(semantic_error(
+            "EMBEDDING_SPACE_INCOMPATIBLE",
+            "configured dimensions differ from active space; run omnisem index",
+        ));
+    }
+    let input = EmbeddingInput {
+        text_hash: ContentHash("transient-query".into()),
+        text: query.to_owned(),
+    };
+    let batch = provider
+        .embed(&[input], &model)
+        .map_err(|error| semantic_error("QUERY_EMBEDDING_FAILED", &error.to_string()))?;
+    if batch.vectors.len() != 1 {
+        return Err(semantic_error(
+            "QUERY_EMBEDDING_FAILED",
+            "provider returned an invalid query-vector count",
+        ));
+    }
+    let vector = normalize_vector(&batch.vectors[0].values)
+        .map_err(|error| semantic_error("QUERY_EMBEDDING_FAILED", &error.to_string()))?;
+    if vector.values.len() != space.dimensions as usize {
+        return Err(semantic_error(
+            "EMBEDDING_SPACE_INCOMPATIBLE",
+            "query-vector dimensions differ from active space",
+        ));
+    }
+    let report = runtime.vector_search.search(
+        connection,
+        config,
+        &space,
+        &vector,
+        request,
+        MAX_SEMANTIC_CANDIDATES,
+    )?;
+    let warnings = (report.corrupt_excluded > 0)
+        .then(|| {
+            format!(
+                "{} corrupt vectors excluded from semantic search",
+                report.corrupt_excluded
+            )
+        })
+        .into_iter()
+        .collect();
+    Ok(SemanticChannel {
+        hits: report.hits,
+        warnings,
+    })
+}
+
+fn semantic_response(
+    connection: &Connection,
+    config: &AppConfig,
+    request: &RetrievalQuery,
+    runtime: &RetrievalRuntime<'_>,
+) -> Result<RetrievalResponse, RetrievalError> {
+    let started = Instant::now();
+    let mut channel = semantic_hits(connection, config, request, runtime)?;
+    let estimator = HeuristicTokenEstimator;
+    let packed = pack_results(
+        &request.query,
+        channel.hits,
+        request.limit.get(),
+        request.token_budget.get(),
+        &estimator,
+        &mut channel.warnings,
+    );
+    let token_estimate = u32::try_from(estimate_response_tokens(
+        &estimator,
+        &request.query,
+        &packed
+            .results
+            .iter()
+            .map(|hit| hit.text.as_str())
+            .collect::<Vec<_>>(),
     ))
+    .unwrap_or(u32::MAX);
+    Ok(RetrievalResponse {
+        query: request.query.clone(),
+        requested_mode: request.mode,
+        mode: RetrievalMode::Semantic,
+        score_kind: "cosine_similarity".into(),
+        results: packed.results,
+        token_estimate,
+        truncated: packed.truncated,
+        applied_limit: request.limit.get(),
+        applied_token_budget: request.token_budget.get(),
+        budget_preset: request.budget_preset.clone(),
+        duplicates_suppressed: 0,
+        warnings: channel.warnings,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    })
 }
 
 /// Maps FTS5 BM25 into a public lexical score.
@@ -503,6 +1019,7 @@ pub const SNAPSHOT_CANDIDATES: usize = 32;
 /// RRF constant k.
 pub const RRF_K: f32 = 60.0;
 
+#[allow(clippy::too_many_arguments)]
 fn federate_with_snapshots(
     connection: &Connection,
     config: &AppConfig,
@@ -511,15 +1028,19 @@ fn federate_with_snapshots(
     local_hits: Vec<RetrievalHit>,
     sensitivity: &SensitivityIndex,
     warnings: &mut Vec<String>,
+    semantic_hits: Vec<RetrievalHit>,
 ) -> Vec<RetrievalHit> {
     let sources = match eligible_snapshot_sources(connection, config, request) {
         Ok(sources) => sources,
         Err(error) => {
             warnings.push(format!("snapshot federation skipped: {error}"));
-            return local_hits;
+            if semantic_hits.is_empty() {
+                return local_hits;
+            }
+            return rrf_merge(&[local_hits, semantic_hits]);
         }
     };
-    if sources.is_empty() {
+    if sources.is_empty() && semantic_hits.is_empty() {
         // Local-only path remains stable: score stays public BM25-derived.
         return local_hits;
     }
@@ -537,6 +1058,10 @@ fn federate_with_snapshots(
                 source.snapshot_id
             )),
         }
+    }
+
+    if !semantic_hits.is_empty() {
+        lists.push(semantic_hits);
     }
 
     if lists.len() == 1 {
@@ -639,6 +1164,11 @@ fn search_snapshot_hits(
                 raw_bm25: Some(raw),
                 public_score: public,
                 federation_score: None,
+                lexical_rank: None,
+                semantic_rank: None,
+                cosine_similarity: None,
+                fusion_score: None,
+                embedding_space_id: None,
             },
             explanation: MatchExplanation {
                 matched_terms,
@@ -667,8 +1197,13 @@ fn rrf_merge(lists: &[Vec<RetrievalHit>]) -> Vec<RetrievalHit> {
         local: bool,
     }
     let mut best: HashMap<String, Acc> = HashMap::new();
+    let mut admitted = 0usize;
     for list in lists {
         for (rank, hit) in list.iter().enumerate() {
+            if admitted >= MAX_FUSION_CANDIDATES {
+                break;
+            }
+            admitted += 1;
             let key = hit.text_hash.0.clone();
             #[allow(clippy::cast_precision_loss)]
             let rank_f = rank as f32;
@@ -679,6 +1214,7 @@ fn rrf_merge(lists: &[Vec<RetrievalHit>]) -> Vec<RetrievalHit> {
                 if existing.local {
                     if is_local {
                         existing.score += contrib;
+                        merge_signals(&mut existing.hit, hit);
                     }
                 } else if is_local {
                     let mut replaced = hit.clone();
@@ -725,10 +1261,34 @@ fn rrf_merge(lists: &[Vec<RetrievalHit>]) -> Vec<RetrievalHit> {
         .into_iter()
         .map(|mut acc| {
             acc.hit.signals.federation_score = Some(acc.score);
+            acc.hit.signals.fusion_score = Some(acc.score);
             acc.hit.score = acc.score;
             acc.hit
         })
         .collect()
+}
+
+fn merge_signals(target: &mut RetrievalHit, incoming: &RetrievalHit) {
+    if target.signals.raw_bm25.is_none() {
+        target.signals.raw_bm25 = incoming.signals.raw_bm25;
+    }
+    if target.signals.cosine_similarity.is_none() {
+        target.signals.cosine_similarity = incoming.signals.cosine_similarity;
+    }
+    if target.signals.semantic_rank.is_none() {
+        target.signals.semantic_rank = incoming.signals.semantic_rank;
+    }
+    if target.signals.embedding_space_id.is_none() {
+        target
+            .signals
+            .embedding_space_id
+            .clone_from(&incoming.signals.embedding_space_id);
+    }
+    if incoming.explanation.explanation_kind == ExplanationKind::SemanticNeighbor
+        && target.explanation.matched_terms.is_empty()
+    {
+        target.explanation = incoming.explanation.clone();
+    }
 }
 
 /// Resolves CLI budget arguments into limit and token budget values.
@@ -771,11 +1331,16 @@ pub fn resolve_budget_args(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{add_root, init_installation};
+    use crate::config::{EmbeddingProviderConfig, add_root, init_installation};
+    use crate::embedding::{
+        EmbeddingBatch, EmbeddingError, EmbeddingProviderKind, ResolvedEmbeddingModel,
+    };
+    use crate::embedding_sync::synchronize_with_provider;
     use crate::index::index_roots;
     use crate::paths::AppPaths;
     use crate::storage::open_database;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     fn seeded() -> (TempDir, AppConfig, Connection) {
@@ -812,6 +1377,210 @@ mod tests {
         let mut connection = open_database(&db).unwrap();
         index_roots(&mut connection, &config, None).unwrap();
         (temp, config, connection)
+    }
+
+    struct SemanticFake {
+        calls: AtomicUsize,
+        digest: &'static str,
+        fail: bool,
+    }
+    impl EmbeddingProvider for SemanticFake {
+        fn provider_kind(&self) -> EmbeddingProviderKind {
+            EmbeddingProviderKind::Ollama
+        }
+        fn resolve_model(&self) -> Result<ResolvedEmbeddingModel, EmbeddingError> {
+            if self.fail {
+                return Err(EmbeddingError::Unavailable);
+            }
+            Ok(ResolvedEmbeddingModel {
+                provider: EmbeddingProviderKind::Ollama,
+                configured_name: "fixture".into(),
+                canonical_name: "fixture:latest".into(),
+                model_digest: self.digest.into(),
+                dimensions: Some(8),
+            })
+        }
+        fn embed(
+            &self,
+            inputs: &[EmbeddingInput],
+            _: &ResolvedEmbeddingModel,
+        ) -> Result<crate::embedding::EmbeddingBatch, EmbeddingError> {
+            self.calls.fetch_add(inputs.len(), Ordering::SeqCst);
+            if self.fail {
+                return Err(EmbeddingError::Unavailable);
+            }
+            Ok(EmbeddingBatch {
+                vectors: inputs
+                    .iter()
+                    .map(|input| EmbeddingVector {
+                        values: if input.text.to_lowercase().contains("sqlite")
+                            || input.text.contains("durable database")
+                        {
+                            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                        } else {
+                            vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                        },
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    fn semantic_seeded() -> (TempDir, AppConfig, Connection, SemanticFake) {
+        let (temp, mut config, mut connection) = seeded();
+        config.embeddings.enabled = true;
+        config.embeddings.provider = EmbeddingProviderConfig::Ollama;
+        config.embeddings.endpoint = "http://127.0.0.1:1".into();
+        config.embeddings.model = "fixture".into();
+        config.embeddings.dimensions = 8;
+        let fake = SemanticFake {
+            calls: AtomicUsize::new(0),
+            digest: "sha256:fixture",
+            fail: false,
+        };
+        synchronize_with_provider(&mut connection, &config.embeddings, &fake).unwrap();
+        fake.calls.store(0, Ordering::SeqCst);
+        (temp, config, connection, fake)
+    }
+
+    #[test]
+    fn semantic_query_is_transient_and_ranks_by_cosine() {
+        let (_temp, config, connection, fake) = semantic_seeded();
+        let request = RetrievalQuery {
+            query: "durable database".into(),
+            root_ids: Vec::new(),
+            file_types: Vec::new(),
+            mode: RetrievalMode::Semantic,
+            limit: RetrievalLimit::new(5).unwrap(),
+            token_budget: TokenBudget::new(2_000).unwrap(),
+            include_sensitive: false,
+            budget_preset: None,
+        };
+        let scanner = SqliteExactVectorSearch;
+        let response = retrieve_with_runtime(
+            &connection,
+            &config,
+            &request,
+            &RetrievalRuntime {
+                embedding_provider: Some(&fake),
+                vector_search: &scanner,
+            },
+        )
+        .unwrap();
+        assert_eq!(response.mode, RetrievalMode::Semantic);
+        assert_eq!(response.score_kind, "cosine_similarity");
+        assert!(response.results[0].text.to_lowercase().contains("sqlite"));
+        assert_eq!(
+            response.results[0].explanation.explanation_kind,
+            ExplanationKind::SemanticNeighbor
+        );
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        let query_rows: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM embedding_vectors WHERE text_hash='transient-query'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(query_rows, 0);
+    }
+
+    #[test]
+    fn hybrid_is_one_pass_and_auto_falls_back() {
+        let (_temp, config, connection, fake) = semantic_seeded();
+        let mut request = RetrievalQuery {
+            query: "SQLite durable database".into(),
+            root_ids: Vec::new(),
+            file_types: Vec::new(),
+            mode: RetrievalMode::Hybrid,
+            limit: RetrievalLimit::new(5).unwrap(),
+            token_budget: TokenBudget::new(2_000).unwrap(),
+            include_sensitive: false,
+            budget_preset: None,
+        };
+        let scanner = SqliteExactVectorSearch;
+        let response = retrieve_with_runtime(
+            &connection,
+            &config,
+            &request,
+            &RetrievalRuntime {
+                embedding_provider: Some(&fake),
+                vector_search: &scanner,
+            },
+        )
+        .unwrap();
+        assert_eq!(response.mode, RetrievalMode::Hybrid);
+        assert!(response.results[0].signals.fusion_score.is_some());
+        assert!(
+            response
+                .results
+                .iter()
+                .any(|hit| hit.signals.raw_bm25.is_some())
+        );
+        assert!(
+            response
+                .results
+                .iter()
+                .any(|hit| hit.signals.cosine_similarity.is_some())
+        );
+        let unavailable = SemanticFake {
+            calls: AtomicUsize::new(0),
+            digest: "sha256:fixture",
+            fail: true,
+        };
+        request.mode = RetrievalMode::Auto;
+        let fallback = retrieve_with_runtime(
+            &connection,
+            &config,
+            &request,
+            &RetrievalRuntime {
+                embedding_provider: Some(&unavailable),
+                vector_search: &scanner,
+            },
+        )
+        .unwrap();
+        assert_eq!(fallback.requested_mode, RetrievalMode::Auto);
+        assert_eq!(fallback.mode, RetrievalMode::Lexical);
+        assert_eq!(fallback.warnings.len(), 1);
+    }
+
+    #[test]
+    fn changed_model_digest_requires_reindex() {
+        let (_temp, config, connection, _fake) = semantic_seeded();
+        let changed = SemanticFake {
+            calls: AtomicUsize::new(0),
+            digest: "sha256:changed",
+            fail: false,
+        };
+        let request = RetrievalQuery {
+            query: "database".into(),
+            root_ids: Vec::new(),
+            file_types: Vec::new(),
+            mode: RetrievalMode::Semantic,
+            limit: RetrievalLimit::new(5).unwrap(),
+            token_budget: TokenBudget::new(2_000).unwrap(),
+            include_sensitive: false,
+            budget_preset: None,
+        };
+        let scanner = SqliteExactVectorSearch;
+        let error = retrieve_with_runtime(
+            &connection,
+            &config,
+            &request,
+            &RetrievalRuntime {
+                embedding_provider: Some(&changed),
+                vector_search: &scanner,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            RetrievalError::Semantic {
+                code: "EMBEDDING_MODEL_CHANGED",
+                ..
+            }
+        ));
+        assert_eq!(changed.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -854,10 +1623,7 @@ mod tests {
             budget_preset: None,
         };
         let error = retrieve(&connection, &config, &request).unwrap_err();
-        assert!(matches!(
-            error,
-            RetrievalError::Domain(crate::domain::DomainError::RetrievalModeUnavailable(_))
-        ));
+        assert!(matches!(error, RetrievalError::Semantic { .. }));
     }
 
     #[test]

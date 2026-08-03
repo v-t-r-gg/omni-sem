@@ -585,6 +585,16 @@ pub struct RetrievalSignals {
     /// Final federation score when multiple indexes contribute (RRF).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federation_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_rank: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_rank: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cosine_similarity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fusion_score: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_space_id: Option<String>,
 }
 
 /// Deterministic match explanation without model inference.
@@ -663,7 +673,9 @@ pub struct RetrievalHit {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalResponse {
     pub query: String,
+    pub requested_mode: RetrievalMode,
     pub mode: RetrievalMode,
+    pub score_kind: String,
     pub results: Vec<RetrievalHit>,
     pub token_estimate: u32,
     pub truncated: bool,
