@@ -14,7 +14,9 @@ use std::time::Instant;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{add_root, init_installation};
+use crate::config::{EmbeddingConfig, add_root, init_installation};
+use crate::embedding::EmbeddingProvider;
+use crate::embedding_sync::synchronize_with_provider;
 use blake3::Hasher;
 
 use crate::domain::{FreshnessStatus, RetrievalLimit, RetrievalMode, RetrievalQuery, TokenBudget};
@@ -22,7 +24,9 @@ use crate::error::{IndexError, RetrievalError};
 use crate::hash::blake3_hex;
 use crate::index::index_roots;
 use crate::paths::AppPaths;
-use crate::retrieval::retrieve;
+use crate::retrieval::{
+    RetrievalRuntime, SqliteExactVectorSearch, retrieve, retrieve_with_runtime,
+};
 use crate::storage::open_database;
 
 /// One corpus document record from `corpus.jsonl`.
@@ -77,6 +81,36 @@ pub struct EvalReport {
     pub index_fingerprint: String,
     pub metrics: EvalMetrics,
     pub per_query: Vec<PerQueryResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<EvalEmbedding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalEmbedding {
+    pub provider: String,
+    pub canonical_model: String,
+    pub model_digest: String,
+    pub dimensions: u32,
+    pub embedding_space_id: String,
+    pub corpus_embedding_ms: u64,
+    pub active_vector_coverage: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalComparison {
+    pub lexical: EvalReport,
+    pub semantic: EvalReport,
+    pub hybrid: EvalReport,
+    pub semantic_minus_lexical: EvalMetricDeltas,
+    pub hybrid_minus_lexical: EvalMetricDeltas,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvalMetricDeltas {
+    pub recall_at_5: f64,
+    pub recall_at_10: f64,
+    pub mrr: f64,
+    pub ndcg: f64,
 }
 
 /// Aggregate metrics for a run.
@@ -129,13 +163,57 @@ pub fn run_evaluation(
     bundle_dir: &Path,
     mode: RetrievalMode,
 ) -> Result<EvalReport, RetrievalError> {
+    run_evaluation_inner(bundle_dir, mode, None, None)
+}
+
+/// Runs semantic-capable evaluation in an isolated installation with an injected provider.
+pub fn run_evaluation_with_provider(
+    bundle_dir: &Path,
+    mode: RetrievalMode,
+    embedding: &EmbeddingConfig,
+    provider: &dyn EmbeddingProvider,
+) -> Result<EvalReport, RetrievalError> {
+    run_evaluation_inner(bundle_dir, mode, Some(embedding), Some(provider))
+}
+
+/// Compares all retrieval modes with deterministic provider wiring.
+pub fn compare_evaluation_with_provider(
+    bundle_dir: &Path,
+    embedding: &EmbeddingConfig,
+    provider: &dyn EmbeddingProvider,
+) -> Result<EvalComparison, RetrievalError> {
+    let lexical = run_evaluation(bundle_dir, RetrievalMode::Lexical)?;
+    let semantic =
+        run_evaluation_with_provider(bundle_dir, RetrievalMode::Semantic, embedding, provider)?;
+    let hybrid =
+        run_evaluation_with_provider(bundle_dir, RetrievalMode::Hybrid, embedding, provider)?;
+    let deltas = |candidate: &EvalReport| EvalMetricDeltas {
+        recall_at_5: candidate.metrics.recall_at_5 - lexical.metrics.recall_at_5,
+        recall_at_10: candidate.metrics.recall_at_10 - lexical.metrics.recall_at_10,
+        mrr: candidate.metrics.mrr - lexical.metrics.mrr,
+        ndcg: candidate.metrics.ndcg - lexical.metrics.ndcg,
+    };
+    let semantic_minus_lexical = deltas(&semantic);
+    let hybrid_minus_lexical = deltas(&hybrid);
+    Ok(EvalComparison {
+        lexical,
+        semantic,
+        hybrid,
+        semantic_minus_lexical,
+        hybrid_minus_lexical,
+    })
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+fn run_evaluation_inner(
+    bundle_dir: &Path,
+    mode: RetrievalMode,
+    embedding: Option<&EmbeddingConfig>,
+    provider: Option<&dyn EmbeddingProvider>,
+) -> Result<EvalReport, RetrievalError> {
     let effective = match mode {
         RetrievalMode::Lexical | RetrievalMode::Auto => RetrievalMode::Lexical,
-        other => {
-            return Err(RetrievalError::Domain(
-                crate::domain::DomainError::RetrievalModeUnavailable(other.as_str().into()),
-            ));
-        }
+        other => other,
     };
 
     let corpus = read_jsonl::<CorpusRecord>(&bundle_dir.join("corpus.jsonl"))?;
@@ -159,6 +237,38 @@ pub fn run_evaluation(
         IndexError::Domain(error) => RetrievalError::Domain(error),
         other => RetrievalError::Evaluation(other.to_string()),
     })?;
+    let embedding_report = if effective == RetrievalMode::Lexical {
+        None
+    } else {
+        let embedding = embedding.ok_or_else(|| {
+            RetrievalError::Evaluation(
+                "semantic evaluation requires embedding configuration".into(),
+            )
+        })?;
+        let provider = provider.ok_or_else(|| {
+            RetrievalError::Evaluation("semantic evaluation requires an embedding provider".into())
+        })?;
+        config.embeddings = embedding.clone();
+        let started = Instant::now();
+        let report = synchronize_with_provider(&mut connection, embedding, provider)
+            .map_err(|error| RetrievalError::Evaluation(error.to_string()))?;
+        let model = provider
+            .resolve_model()
+            .map_err(|error| RetrievalError::Evaluation(error.to_string()))?;
+        Some(EvalEmbedding {
+            provider: model.provider.to_string(),
+            canonical_model: model.canonical_name,
+            model_digest: model.model_digest,
+            dimensions: report.dimensions.unwrap_or(0),
+            embedding_space_id: report.embedding_space.unwrap_or_default(),
+            corpus_embedding_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            active_vector_coverage: if report.active_segments == 0 {
+                0.0
+            } else {
+                f64::from(report.linked_segments) / f64::from(report.active_segments)
+            },
+        })
+    };
 
     let path_to_doc = corpus
         .iter()
@@ -186,7 +296,20 @@ pub fn run_evaluation(
             budget_preset: None,
         };
         let started = Instant::now();
-        let response = retrieve(&connection, &config, &request)?;
+        let response = if effective == RetrievalMode::Lexical {
+            retrieve(&connection, &config, &request)?
+        } else {
+            let scanner = SqliteExactVectorSearch;
+            retrieve_with_runtime(
+                &connection,
+                &config,
+                &request,
+                &RetrievalRuntime {
+                    embedding_provider: provider,
+                    vector_search: &scanner,
+                },
+            )?
+        };
         let latency_ms = started.elapsed().as_secs_f64() * 1_000.0;
         latencies.push(latency_ms);
 
@@ -248,6 +371,7 @@ pub fn run_evaluation(
         index_fingerprint,
         metrics,
         per_query,
+        embedding: embedding_report,
     })
 }
 
@@ -591,6 +715,10 @@ mod tests {
     use crate::domain::{
         FreshnessStatus, RetrievalLimit, RetrievalMode, RetrievalQuery, TokenBudget,
     };
+    use crate::embedding::{
+        EmbeddingBatch, EmbeddingError, EmbeddingInput, EmbeddingProviderKind, EmbeddingVector,
+        ResolvedEmbeddingModel,
+    };
     use crate::index::index_roots;
     use crate::paths::AppPaths;
     use crate::retrieval::retrieve;
@@ -601,6 +729,72 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    struct EvalFake;
+    impl EmbeddingProvider for EvalFake {
+        fn provider_kind(&self) -> EmbeddingProviderKind {
+            EmbeddingProviderKind::Ollama
+        }
+        fn resolve_model(&self) -> Result<ResolvedEmbeddingModel, EmbeddingError> {
+            Ok(ResolvedEmbeddingModel {
+                provider: EmbeddingProviderKind::Ollama,
+                configured_name: "eval".into(),
+                canonical_name: "eval:latest".into(),
+                model_digest: "sha256:eval".into(),
+                dimensions: Some(8),
+            })
+        }
+        fn embed(
+            &self,
+            inputs: &[EmbeddingInput],
+            _: &ResolvedEmbeddingModel,
+        ) -> Result<EmbeddingBatch, EmbeddingError> {
+            Ok(EmbeddingBatch {
+                vectors: inputs
+                    .iter()
+                    .map(|input| {
+                        let mut values = vec![0.0; 8];
+                        for byte in input.text.bytes() {
+                            values[usize::from(byte) % 8] += 1.0;
+                        }
+                        EmbeddingVector { values }
+                    })
+                    .collect(),
+            })
+        }
+    }
+
+    fn eval_embedding() -> EmbeddingConfig {
+        EmbeddingConfig {
+            enabled: true,
+            provider: crate::config::EmbeddingProviderConfig::Ollama,
+            endpoint: "http://127.0.0.1:1".into(),
+            model: "eval".into(),
+            batch_size: 16,
+            request_timeout_seconds: 1,
+            keep_alive: "5m".into(),
+            truncate: false,
+            dimensions: 8,
+        }
+    }
+
+    #[test]
+    fn semantic_and_comparison_evaluation_are_isolated() {
+        let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+        let semantic = run_evaluation_with_provider(
+            &bundle,
+            RetrievalMode::Semantic,
+            &eval_embedding(),
+            &EvalFake,
+        )
+        .unwrap();
+        assert_eq!(semantic.mode, "semantic");
+        assert!(semantic.embedding.is_some());
+        let comparison =
+            compare_evaluation_with_provider(&bundle, &eval_embedding(), &EvalFake).unwrap();
+        assert_eq!(comparison.lexical.mode, "lexical");
+        assert_eq!(comparison.hybrid.mode, "hybrid");
+    }
 
     #[test]
     fn reference_bundle_runs_deterministically() {
