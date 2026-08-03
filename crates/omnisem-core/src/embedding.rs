@@ -192,6 +192,8 @@ pub enum EmbeddingError {
     FeatureDisabled,
     #[error("EMBEDDING_MODEL_NOT_FOUND: configured model was not reported by Ollama")]
     ModelNotFound,
+    #[error("EMBEDDING_MODEL_CHANGED: resolved model compatibility changed")]
+    ModelChanged,
     #[error("EMBEDDING_FAILED: {0}")]
     Failed(String),
     #[error("EMBEDDING_RESPONSE_INVALID: {0}")]
@@ -211,6 +213,7 @@ impl EmbeddingError {
             Self::Unavailable => "EMBEDDING_UNAVAILABLE",
             Self::FeatureDisabled => "EMBEDDING_FEATURE_DISABLED",
             Self::ModelNotFound => "EMBEDDING_MODEL_NOT_FOUND",
+            Self::ModelChanged => "EMBEDDING_MODEL_CHANGED",
             Self::Failed(_) => "EMBEDDING_FAILED",
             Self::ResponseInvalid(_) => "EMBEDDING_RESPONSE_INVALID",
             Self::DimensionMismatch { .. } => "EMBEDDING_DIMENSION_MISMATCH",
@@ -222,7 +225,11 @@ impl EmbeddingError {
     pub fn systemic(&self) -> bool {
         matches!(
             self,
-            Self::Unavailable | Self::FeatureDisabled | Self::ModelNotFound | Self::Failed(_)
+            Self::Unavailable
+                | Self::FeatureDisabled
+                | Self::ModelNotFound
+                | Self::ModelChanged
+                | Self::Failed(_)
         )
     }
 }

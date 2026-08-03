@@ -105,6 +105,8 @@ pub struct EvalComparison {
     pub hybrid: EvalReport,
     pub semantic_minus_lexical: EvalMetricDeltas,
     pub hybrid_minus_lexical: EvalMetricDeltas,
+    pub embedding_sync_runs: u32,
+    pub embedding_sync_status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +127,7 @@ impl EmbeddingProvider for PinnedProvider<'_> {
         self.model.provider
     }
     fn resolve_model(&self) -> Result<ResolvedEmbeddingModel, EmbeddingError> {
+        self.validate_current()?;
         Ok(self.model.clone())
     }
     fn embed(
@@ -133,11 +136,25 @@ impl EmbeddingProvider for PinnedProvider<'_> {
         model: &ResolvedEmbeddingModel,
     ) -> Result<EmbeddingBatch, EmbeddingError> {
         if model != &self.model {
-            return Err(EmbeddingError::Failed(
-                "evaluation model pin mismatch".into(),
-            ));
+            return Err(EmbeddingError::ModelChanged);
         }
+        self.validate_current()?;
         self.inner.embed(inputs, model)
+    }
+}
+
+impl PinnedProvider<'_> {
+    fn validate_current(&self) -> Result<(), EmbeddingError> {
+        let current = self.inner.resolve_model()?;
+        if self.inner.provider_kind() != self.model.provider
+            || current.provider != self.model.provider
+            || current.canonical_name != self.model.canonical_name
+            || current.model_digest != self.model.model_digest
+            || current.dimensions != self.model.dimensions
+        {
+            return Err(EmbeddingError::ModelChanged);
+        }
+        Ok(())
     }
 }
 
@@ -224,6 +241,7 @@ pub fn run_evaluation_with_provider(
 ///
 /// # Errors
 /// Returns when any isolated mode run cannot be completed.
+#[allow(clippy::too_many_lines)]
 pub fn compare_evaluation_with_provider(
     bundle_dir: &Path,
     embedding: &EmbeddingConfig,
@@ -240,10 +258,23 @@ pub fn compare_evaluation_with_provider(
     let root_dir = temp.path().join("corpus");
     materialize_corpus(&root_dir, &corpus)?;
     add_root(&mut config, &root_dir, Some("eval".into()))?;
-    config.embeddings = embedding.clone();
+    // Corpus setup is deliberately provider-inert. Install the enabled embedding
+    // configuration only after lexical indexing has completed.
     config.save(&paths.config_file)?;
     let mut connection = open_database(&config.database_path()?)?;
     index_roots(&mut connection, &config, None).map_err(index_to_retrieval)?;
+    let preliminary_runs: u32 = connection
+        .query_row("SELECT count(*) FROM embedding_sync_runs", [], |row| {
+            row.get(0)
+        })
+        .map_err(crate::storage::StorageError::from)?;
+    if preliminary_runs != 0 {
+        return Err(RetrievalError::Evaluation(
+            "provider-inert comparison setup recorded an embedding sync".into(),
+        ));
+    }
+    config.embeddings = embedding.clone();
+    config.save(&paths.config_file)?;
     let resolved = provider
         .resolve_model()
         .map_err(|error| RetrievalError::Evaluation(error.to_string()))?;
@@ -257,6 +288,18 @@ pub fn compare_evaluation_with_provider(
     if sync.status != "completed" || sync.missing_segments != 0 {
         return Err(RetrievalError::Evaluation(
             "shared comparison embedding synchronization was incomplete".into(),
+        ));
+    }
+    let (sync_runs, completed_runs): (u32, u32) = connection
+        .query_row(
+            "SELECT count(*),sum(CASE WHEN status='completed' THEN 1 ELSE 0 END) FROM embedding_sync_runs",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(crate::storage::StorageError::from)?;
+    if sync_runs != 1 || completed_runs != 1 {
+        return Err(RetrievalError::Evaluation(
+            "comparison expected exactly one completed embedding synchronization".into(),
         ));
     }
     let shared_embedding = EvalEmbedding {
@@ -327,6 +370,8 @@ pub fn compare_evaluation_with_provider(
         hybrid,
         semantic_minus_lexical,
         hybrid_minus_lexical,
+        embedding_sync_runs: sync_runs,
+        embedding_sync_status: sync.status,
     })
 }
 
@@ -946,8 +991,9 @@ mod tests {
     use crate::storage::open_database;
     use std::fs;
     use std::io::Write;
+    use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -956,6 +1002,75 @@ mod tests {
     struct EvalFake {
         segment_batches: AtomicUsize,
         query_calls: AtomicUsize,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ModelMutation {
+        Digest,
+        Canonical,
+        Dimensions,
+    }
+
+    struct ChangingFake {
+        segment_embedded: AtomicBool,
+        query_calls: AtomicUsize,
+        mutation: ModelMutation,
+    }
+
+    impl EmbeddingProvider for ChangingFake {
+        fn provider_kind(&self) -> EmbeddingProviderKind {
+            EmbeddingProviderKind::Ollama
+        }
+        fn resolve_model(&self) -> Result<ResolvedEmbeddingModel, EmbeddingError> {
+            let changed = self.segment_embedded.load(Ordering::SeqCst);
+            Ok(ResolvedEmbeddingModel {
+                provider: EmbeddingProviderKind::Ollama,
+                configured_name: "eval".into(),
+                canonical_name: if changed && matches!(self.mutation, ModelMutation::Canonical) {
+                    "eval:changed".into()
+                } else {
+                    "eval:latest".into()
+                },
+                model_digest: if changed && matches!(self.mutation, ModelMutation::Digest) {
+                    "sha256:changed".into()
+                } else {
+                    "sha256:eval".into()
+                },
+                dimensions: Some(
+                    if changed && matches!(self.mutation, ModelMutation::Dimensions) {
+                        7
+                    } else {
+                        8
+                    },
+                ),
+            })
+        }
+        fn embed(
+            &self,
+            inputs: &[EmbeddingInput],
+            _: &ResolvedEmbeddingModel,
+        ) -> Result<EmbeddingBatch, EmbeddingError> {
+            if inputs
+                .iter()
+                .all(|input| input.purpose == crate::embedding::EmbeddingInputPurpose::Segment)
+            {
+                self.segment_embedded.store(true, Ordering::SeqCst);
+            }
+            if inputs
+                .iter()
+                .any(|input| input.purpose == crate::embedding::EmbeddingInputPurpose::Query)
+            {
+                self.query_calls.fetch_add(inputs.len(), Ordering::SeqCst);
+            }
+            Ok(EmbeddingBatch {
+                vectors: inputs
+                    .iter()
+                    .map(|_| EmbeddingVector {
+                        values: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    })
+                    .collect(),
+            })
+        }
     }
     impl EmbeddingProvider for EvalFake {
         fn provider_kind(&self) -> EmbeddingProviderKind {
@@ -1034,11 +1149,23 @@ mod tests {
         let user_connection = open_database(&user_config.database_path().unwrap()).unwrap();
         let user_changes = user_connection.total_changes();
         let fake = EvalFake::default();
-        let comparison =
-            compare_evaluation_with_provider(&bundle, &eval_embedding(), &fake).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut embedding = eval_embedding();
+        embedding.endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let comparison = compare_evaluation_with_provider(&bundle, &embedding, &fake).unwrap();
         assert_eq!(comparison.lexical.mode, "lexical");
         assert_eq!(comparison.hybrid.mode, "hybrid");
         assert_eq!(fake.segment_batches.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.query_calls.load(Ordering::SeqCst),
+            comparison.semantic.query_count + comparison.hybrid.query_count
+        );
+        assert_eq!(comparison.embedding_sync_runs, 1);
+        assert_eq!(comparison.embedding_sync_status, "completed");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
         assert_eq!(
             comparison.lexical.index_fingerprint,
             comparison.semantic.index_fingerprint
@@ -1073,6 +1200,44 @@ mod tests {
         );
         assert!(comparison.semantic.metrics.p95_query_embedding_ms >= 0.0);
         assert_eq!(user_connection.total_changes(), user_changes);
+    }
+
+    #[test]
+    fn comparison_revalidates_mutable_model_before_query_embedding() {
+        let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+        for mutation in [
+            ModelMutation::Digest,
+            ModelMutation::Canonical,
+            ModelMutation::Dimensions,
+        ] {
+            let provider = ChangingFake {
+                segment_embedded: AtomicBool::new(false),
+                query_calls: AtomicUsize::new(0),
+                mutation,
+            };
+            let error = compare_evaluation_with_provider(&bundle, &eval_embedding(), &provider)
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RetrievalError::Semantic {
+                    code: "EMBEDDING_MODEL_CHANGED",
+                    ..
+                }
+            ));
+            assert_eq!(provider.query_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn lexical_single_mode_never_connects_to_configured_endpoint() {
+        let bundle = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let report = run_evaluation(&bundle, RetrievalMode::Lexical).unwrap();
+        assert_eq!(report.mode, "lexical");
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
     }
 
     #[test]

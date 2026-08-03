@@ -12,4 +12,6 @@ Lexical never constructs a provider. Explicit semantic and hybrid fail if their 
 
 Provider inputs carry a provider-neutral purpose (`segment` or transient `query`). Segment materialization remains `segment-text-v1`; query input is `query-text-v1`. The purpose does not alter Ollama's external JSON shape. Semantic compatibility directly checks configured dimensions when nonzero before model resolution or vector scanning.
 
+Comparison setup keeps embeddings disabled through lexical indexing and requires zero preliminary sync history. It then performs one injected synchronization. The saved provider/model/digest/dimension identity is re-resolved immediately before every query embedding. This detects mutable-tag changes but does not make Ollama digest-addressable: `/api/embed` continues to receive the configured tag.
+
 Retrieval telemetry separately measures query embedding and exact scanning with a monotonic clock and reports active vectors examined, corrupt exclusions, per-channel candidate counts, fusion admissions, unique fused results, and exact duplicate suppression. It contains no query content or provider transport details.

@@ -52,3 +52,4 @@ All notable changes will be documented here. The format follows Keep a Changelog
 - Preserve one-based lexical and semantic channel ranks through one-pass fusion.
 - Run comparison evaluation on one pinned-model, single-materialization temporary index.
 - Add privacy-safe query-embedding, exact-scan, channel, and fusion telemetry.
+- Keep comparison lexical setup provider-inert and revalidate mutable model identity before every query embedding.
